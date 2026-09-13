@@ -54,12 +54,26 @@ pnpm start               # electron-vite dev，日志打到控制台与 uia-prob
 - 单次探测默认 **500ms 硬超时**（`UIA_TIMEOUT_MS` 可调）。超时后放弃该工作线程，下次调用自动换新线程，目标进程卡死不会拖挂本进程。
 - 全程零剪贴板依赖：探测路径不包含任何剪贴板 API，UIA 跨进程读取选区，剪贴板不可能被触碰（由实现保证，无需运行时自证）。
 
-## 已知兼容边界
+## 场景支持情况
 
+### 已验证可用（文本 + 坐标完整返回）
+
+- **Chrome / Edge 网页正文划词**（核心场景）：单行、多行（13 行全选 482 字符 + 13 个逐行 rect）、中英混排均正常；坐标为物理像素，单显示器 200% DPI 下与屏幕位置精确对齐（页面内容左缘逻辑 160px → rect x=320）。
+- **Chromium 表单控件**：`<input>` / `<textarea>` 双击选词，文本 + 1 个精确 rect；**地址栏**选中的完整 URL 同样可提取（聚焦元素直接是 Edit 控件，走 `focused-element` 最短路径）。
+- **Electron 应用网页区**：本 app 面板自身及任意基于 Electron 的第三方软件，焦点落在网页区时走同一条 Chromium 无障碍管线。
+- **失败路径**：空选区返回 `EmptySelection`（不崩溃）；探测中重复触发返回 `Busy`（不排队）；目标窗口无 TextPattern 时返回 `TextPatternNotSupported` 并携带进程名。所有失败 <25ms，无超时挂起。
+
+### 支持不佳 / 已知边界
+
+- **VS Code（Electron 应用，辅助功能默认关闭）**：前台窗口枚举常直接返回 `TextPatternNotSupported`；个别 Edit 控件可见但选区多为光标态（`EmptySelection`）。在 VS Code 内启用完整的屏幕阅读器模式（`Shift+Alt+F1`）后理论上走 Electron 管线，但未实测，不承诺支持。
+- **Chromium 内置 PDF 阅读器（实测 Edge 137）**：不通过 UIA TextPattern 暴露选区文本 —— 聚焦元素无 TextPattern，tree-search 回退可找到带 pattern 的元素但 `GetSelection` 返回的 range 无文本（`EmptySelection`）。
 - **Chromium 无障碍精简模式（重要）**：Chromium 默认不完整暴露 renderer 排版树。a11y 树完整激活前，Document 级选区可能取不到 bounding rectangles（文本仍可读）；树激活后（首次 UIA 树枚举 / 屏幕阅读器接入 / `--force-renderer-accessibility` 启动参数）文本与逐行坐标均完整返回。实测同一页面激活前后：`rectCount: 0` → `rectCount: 13`。
-- **PDF 查看器（实测 Edge 137）**：内置 PDF 阅读器不通过 UIA TextPattern 暴露选区文本 —— 聚焦元素无 TextPattern，tree-search 回退可找到带 pattern 的元素但 `GetSelection` 返回的 range 无文本（`EmptySelection`）。标记为兼容边界。
-- **多显示器**：坐标为物理像素，单显示器 200% DPI 环境下实测与屏幕位置精确对齐（页面内容左缘逻辑 160px → 返回 rect x=320）；第二显示器偏移未在本环境验证。
-- Electron 宿主自身（本 app 无窗口）也可以作为"基于 Electron 的第三方软件"目标验证：焦点落在任何 Electron 窗口的网页区时同样走 Chromium 无障碍管线。
+- **两个展示层陷阱（文本提取本身不受影响）**：① 精简模式下可能"成功但 `rects.length === 0`"，产品侧用 `rects[0]` 做气泡锚点前需判空；② 多行折行边界可能产生 1px 宽的退化矩形，画高亮框前建议过滤宽度 ≤1px 的 rect。
+
+### 未验证 / 超出 PoC 范围
+
+- 传统 Win32 应用（记事本、Office、资源管理器等）：本 PoC 专项针对 Chromium 体系，未做适配与测试，不支持是预期行为。
+- 多显示器第二屏偏移、管理员权限窗口（UIA 跨完整性级别访问）、HTA/嵌入式 WebView2 等场景均未验证。
 
 ## 产品接口 vs 审计接口
 
