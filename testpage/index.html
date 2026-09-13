@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>UIA-TEST</title>
+  <style>
+    body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 18px; margin: 40px; max-width: 640px; }
+    p { line-height: 1.8; }
+    input, textarea { font-size: 18px; margin: 12px 0; display: block; }
+    .hint { color: #888; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>UIA Selection Test Page 划词测试页</h1>
+
+  <p id="para1">The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.</p>
+
+  <p id="para2">这是一段用于测试的中文文本，包含中英混排 mixed content 与标点符号，用于验证纯文本完整提取。</p>
+
+  <p id="para3">Line one of the multi-line paragraph.
+Line two of the multi-line paragraph.
+Line three of the multi-line paragraph.</p>
+
+  <p class="hint">Input / textarea below (double-click a word or Ctrl+A):</p>
+  <input id="input1" value="input box text 输入框内容 12345" size="50">
+  <textarea id="ta1" rows="4" cols="52">textarea line A 第一行内容
+textarea line B 第二行内容</textarea>
+
+  <p class="hint">Page title is "UIA-TEST" so the probe log can be matched to this tab.</p>
+</body>
+</html>
