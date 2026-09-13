@@ -6,6 +6,10 @@
 
 ```
 ├── src/main/index.ts        # Electron 主进程：全局快捷键 + JSON 日志（走审计接口）
+├── src/main/config.ts       # uia-config.json 读写（配置文件 > 环境变量 > 默认值）
+├── src/preload/index.ts     # contextBridge：onProbeResult / getState / getConfig / setConfig …
+├── src/renderer/            # 结果面板：最新划词结果 + 最近 20 条历史 + 设置
+├── src/shared/types.ts      # ProbeRecord / AppConfig（主进程与渲染进程共用）
 ├── native/                  # Rust napi-rs 原生模块（workspace 成员）
 │   ├── src/lib.rs           # UIA COM 探测核心（专用 COM MTA 工作线程 + 500ms 超时）
 │   │                        #   导出 probeSelection（产品 4 字段）/ probeSelectionDetailed（审计）
@@ -23,10 +27,14 @@
 pnpm install
 pnpm build:native        # cargo build --release + 复制 DLL 为 .node（需 MSVC BuildTools + Rust）
 node scripts/gen-pdf.mjs # 可选：重新生成测试 PDF
-pnpm start               # electron-vite dev --noWatch，日志打到控制台与 uia-probe.log
+pnpm start               # electron-vite dev，日志打到控制台与 uia-probe.log
 ```
 
-启动后在 Chrome/Edge 打开任意网页（或 `testpage/index.html`），划选文字，按 **Ctrl+Shift+F3** 触发探测。每次触发输出一行 JSON：
+启动后会同时打开一个**结果面板**窗口：显示最近一次划词结果（文本 / 目标应用 / rects / 耗时 / 错误码）、最近 20 条历史（点击回看），以及设置区。点关闭只是隐藏面板，进程和热键继续工作；按**面板热键**（默认 `Ctrl+Shift+1`）可重新唤出。
+
+设置区可调：划词热键（默认 `Ctrl+Shift+2`，点击输入框后按组合键录入）、面板热键、超时毫秒数、窗口置顶；"保存配置"即生效并写入应用根目录的 `uia-config.json`（优先级：配置文件 > `UIA_HOTKEY`/`UIA_TIMEOUT_MS` 环境变量 > 默认值）。面板上的"立即探测"按钮等价于按划词热键。
+
+启动后在 Chrome/Edge 打开任意网页（或 `testpage/index.html`），划选文字，按划词热键触发探测。每次触发输出一行 JSON：
 
 ```json
 {"timestamp":"2026-09-13T12:00:00.000Z","level":"probe","seq":1,"trigger":"hotkey","success":true,

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'" />
+    <title>UIA 划词探测</title>
+    <script type="module" src="./src/main.ts"></script>
+  </head>
+  <body>
+    <header>
+      <h1>UIA 划词探测</h1>
+      <button id="probe-now" class="primary">立即探测</button>
+    </header>
+
+    <main>
+      <section id="latest" class="card">
+        <div id="banner" class="banner idle">等待第一次探测…</div>
+        <div id="detail" class="detail empty">按划词热键或点击"立即探测"开始</div>
+      </section>
+
+      <section class="card">
+        <h2>最近记录</h2>
+        <ul id="history" class="history"></ul>
+      </section>
+
+      <section class="card">
+        <h2>设置</h2>
+        <div class="form-row">
+          <label for="hotkey">划词热键</label>
+          <input id="hotkey" class="hotkey-input" readonly placeholder="点击后按下组合键" />
+        </div>
+        <div class="form-row">
+          <label for="panel-hotkey">面板热键</label>
+          <input id="panel-hotkey" class="hotkey-input" readonly placeholder="点击后按下组合键" />
+        </div>
+        <div class="form-row">
+          <label for="timeout">超时 (ms)</label>
+          <input id="timeout" type="number" min="100" max="10000" step="50" />
+        </div>
+        <div class="form-row">
+          <label for="on-top">窗口置顶</label>
+          <input id="on-top" type="checkbox" />
+        </div>
+        <div class="form-actions">
+          <button id="save-config" class="primary">保存配置</button>
+          <span id="save-status" class="save-status"></span>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
