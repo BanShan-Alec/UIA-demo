@@ -1,0 +1,7 @@
+node_modules/
+out/
+dist/
+*.log
+native/target/
+native/*.node
+native/uia_probe.d.ts

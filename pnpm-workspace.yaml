@@ -1,0 +1,5 @@
+packages:
+  - native
+allowBuilds:
+  electron: true
+  esbuild: true
