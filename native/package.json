@@ -1,0 +1,11 @@
+{
+  "name": "uia-probe",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "types": "uia_probe.d.ts",
+  "scripts": {
+    "build": "napi build --platform --release --dts uia_probe.d.ts",
+    "build:debug": "napi build --platform --dts uia_probe.d.ts"
+  }
+}
