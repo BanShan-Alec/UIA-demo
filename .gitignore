@@ -5,3 +5,4 @@ dist/
 native/target/
 native/*.node
 native/uia_probe.d.ts
+.zcode/
