@@ -42,6 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
   EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 
+mod dot;
+
 const MAX_TEXT_CHARS: usize = 10_000;
 const MAX_RECTS: usize = 4_096;
 /// Expanded unit text is a diagnostic payload, not a product return value.
@@ -53,6 +55,7 @@ const MAX_EXPAND_TEXT_CHARS: usize = 5_000;
 // ---------------------------------------------------------------------------
 
 #[napi(object)]
+#[derive(Clone)]
 pub struct SelectionRect {
   /// Absolute screen coordinate (physical pixels) of the line fragment.
   pub x: f64,
@@ -231,9 +234,17 @@ impl ExpandProbeResult {
 
 enum ProbeCmd {
   Probe { reply: Sender<ProbeResult> },
+  ProbeWindow {
+    hwnd: isize,
+    reply: Sender<ProbeResult>,
+  },
   Expand {
     reply: Sender<ExpandProbeResult>,
     window_title: Option<String>,
+  },
+  ExpandWindow {
+    hwnd: isize,
+    reply: Sender<ExpandProbeResult>,
   },
 }
 
@@ -349,6 +360,64 @@ fn expand_with_timeout(timeout: Duration, window_title: Option<String>) -> Expan
   }
 }
 
+/// Dot-trigger path: read the live selection from a specific target window.
+/// Used by the native dot thread at mouse-up and at click time.
+pub(crate) fn probe_selection_for_window_sync(
+  hwnd: isize,
+  timeout: Duration,
+) -> SelectionResult {
+  let start = Instant::now();
+  let result = match run_on_worker(timeout, |reply| ProbeCmd::ProbeWindow { hwnd, reply }) {
+    Ok(result) => result,
+    Err(WorkerError::StartFailed) => ProbeResult::err(
+      "ComInitFailed",
+      "failed to start UIA worker thread",
+      start,
+    ),
+    Err(WorkerError::Timeout) => ProbeResult::err(
+      "Timeout",
+      format!(
+        "dot selection probe did not complete within {} ms",
+        timeout.as_millis()
+      ),
+      start,
+    ),
+    Err(WorkerError::Disconnected) => ProbeResult::err(
+      "ComError",
+      "UIA worker thread exited unexpectedly",
+      start,
+    ),
+  };
+  result.into()
+}
+
+/// Dot-trigger path: read the enclosing paragraph from a specific target
+/// window. The dot thread calls this after `probe_selection_for_window_sync`.
+pub(crate) fn probe_expand_for_window_sync(hwnd: isize, timeout: Duration) -> ExpandProbeResult {
+  let start = Instant::now();
+  match run_on_worker(timeout, |reply| ProbeCmd::ExpandWindow { hwnd, reply }) {
+    Ok(result) => result,
+    Err(WorkerError::StartFailed) => ExpandProbeResult::err(
+      "ComInitFailed",
+      "failed to start UIA worker thread",
+      start,
+    ),
+    Err(WorkerError::Timeout) => ExpandProbeResult::err(
+      "Timeout",
+      format!(
+        "dot paragraph probe did not complete within {} ms",
+        timeout.as_millis()
+      ),
+      start,
+    ),
+    Err(WorkerError::Disconnected) => ExpandProbeResult::err(
+      "ComError",
+      "UIA worker thread exited unexpectedly",
+      start,
+    ),
+  }
+}
+
 fn spawn_worker() -> Option<WorkerHandle> {
   let (tx, rx) = channel::<ProbeCmd>();
   let id = WORKER_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
@@ -372,9 +441,37 @@ fn spawn_worker() -> Option<WorkerHandle> {
             };
             let _ = reply.send(result); // receiver may be gone after a timeout — fine
           }
+          ProbeCmd::ProbeWindow { hwnd, reply } => {
+            let result = if com_init.is_ok() {
+              unsafe { run_probe_for_hwnd(Some(HWND(hwnd as *mut core::ffi::c_void))) }
+            } else {
+              ProbeResult::err(
+                "ComInitFailed",
+                format!("CoInitializeEx failed: {com_init:?}"),
+                Instant::now(),
+              )
+            };
+            let _ = reply.send(result);
+          }
           ProbeCmd::Expand { reply, window_title } => {
             let result = if com_init.is_ok() {
-              unsafe { run_expand_probe(window_title) }
+              let target = match window_title {
+                Some(title) => ExpandTarget::Title(title),
+                None => ExpandTarget::Foreground,
+              };
+              unsafe { run_expand_probe(target) }
+            } else {
+              ExpandProbeResult::err(
+                "ComInitFailed",
+                format!("CoInitializeEx failed: {com_init:?}"),
+                Instant::now(),
+              )
+            };
+            let _ = reply.send(result);
+          }
+          ProbeCmd::ExpandWindow { hwnd, reply } => {
+            let result = if com_init.is_ok() {
+              unsafe { run_expand_probe(ExpandTarget::Hwnd(hwnd)) }
             } else {
               ExpandProbeResult::err(
                 "ComInitFailed",
@@ -416,6 +513,23 @@ unsafe fn locate_target(start: Instant) -> std::result::Result<Target, ProbeResu
     return Err(ProbeResult::err(
       "NoForegroundWindow",
       "GetForegroundWindow returned NULL",
+      start,
+    ));
+  }
+  locate_target_for_hwnd(hwnd, start)
+}
+
+/// Locate a TextPattern for a specific top-level window. The dot thread
+/// captures the target HWND at mouse-up and must keep reading that window even
+/// if clicking the dot changes system focus.
+unsafe fn locate_target_for_hwnd(
+  hwnd: HWND,
+  start: Instant,
+) -> std::result::Result<Target, ProbeResult> {
+  if hwnd.0.is_null() {
+    return Err(ProbeResult::err(
+      "NoForegroundWindow",
+      "target HWND is null",
       start,
     ));
   }
@@ -476,6 +590,18 @@ unsafe fn locate_target(start: Instant) -> std::result::Result<Target, ProbeResu
     }
   };
 
+  if focused
+    .CurrentIsPassword()
+    .map(|b| b.as_bool())
+    .unwrap_or(false)
+  {
+    return Err(fail_ctx(
+      result,
+      "PasswordField",
+      "focused element is a password field".into(),
+    ));
+  }
+
   let mut focus_info = FocusInfo {
     name: truncate(el_name(&focused), 120),
     control_type: control_type_name(&focused),
@@ -513,7 +639,17 @@ unsafe fn locate_target(start: Instant) -> std::result::Result<Target, ProbeResu
       }
     };
     match root.FindFirst(TreeScope_Descendants, &condition) {
-      Ok(el) => pattern = text_pattern(&el),
+      Ok(el) => {
+        if el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) {
+          result.focused_element = Some(focus_info);
+          return Err(fail_ctx(
+            result,
+            "PasswordField",
+            "fallback element is a password field".into(),
+          ));
+        }
+        pattern = text_pattern(&el);
+      }
       Err(_) => {
         result.focused_element = Some(focus_info);
         return Err(fail_ctx(
@@ -726,8 +862,16 @@ unsafe fn locate_target_by_title(
 }
 
 unsafe fn run_probe() -> ProbeResult {
+  run_probe_for_hwnd(None)
+}
+
+unsafe fn run_probe_for_hwnd(hwnd: Option<HWND>) -> ProbeResult {
   let start = Instant::now();
-  let target = match locate_target(start) {
+  let target = match hwnd {
+    Some(h) => locate_target_for_hwnd(h, start),
+    None => locate_target(start),
+  };
+  let target = match target {
     Ok(t) => t,
     Err(e) => return e,
   };
@@ -842,11 +986,20 @@ unsafe fn run_probe() -> ProbeResult {
 /// it never shrinks a range that is already larger than the unit. Comparing
 /// each result's character count with the document length exposes silent
 /// degradation to Page/Document (the Snapword PRD's Q-1 risk).
-unsafe fn run_expand_probe(window_title: Option<String>) -> ExpandProbeResult {
+enum ExpandTarget {
+  Foreground,
+  Title(String),
+  Hwnd(isize),
+}
+
+unsafe fn run_expand_probe(target: ExpandTarget) -> ExpandProbeResult {
   let start = Instant::now();
-  let target = match window_title {
-    Some(title) => locate_target_by_title(&title, start),
-    None => locate_target(start),
+  let target = match target {
+    ExpandTarget::Foreground => locate_target(start),
+    ExpandTarget::Title(title) => locate_target_by_title(&title, start),
+    ExpandTarget::Hwnd(hwnd) => {
+      locate_target_for_hwnd(HWND(hwnd as *mut core::ffi::c_void), start)
+    }
   };
   let target = match target {
     Ok(t) => t,
