@@ -1,6 +1,6 @@
 import './style.css'
 import type { PanelApi } from '../../preload/index'
-import type { AppConfig, ProbeRecord, SetConfigResult } from '../../shared/types'
+import type { AppConfig, DotSelection, ProbeRecord, SetConfigResult } from '../../shared/types'
 
 declare global {
   interface Window {
@@ -18,6 +18,8 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 
 const banner = $('banner')
 const detail = $('detail')
+const dotCard = $('dot-card')
+const dotDetail = $('dot-detail')
 const historyEl = $('history')
 const saveStatus = $('save-status')
 const hotkeyInput = $<HTMLInputElement>('hotkey')
@@ -72,6 +74,47 @@ function renderDetail(record: ProbeRecord): void {
       ul.append(li)
     }
     detail.append(`矩形区域 ×${record.rectCount}：`, ul)
+  }
+}
+
+function renderDotSelection(selection: DotSelection): void {
+  dotCard.hidden = false
+  dotDetail.className = 'detail'
+  dotDetail.replaceChildren()
+
+  const rows: Array<[string, string]> = [
+    ['目标应用', selection.processName],
+    [
+      '圆点位置',
+      `rect(${Math.round(selection.dotRect.x)}, ${Math.round(selection.dotRect.y)}, ${Math.round(selection.dotRect.width)}, ${Math.round(selection.dotRect.height)})`
+    ],
+    ['所在段落', selection.paragraph ?? '语境不可用']
+  ]
+  if (selection.paragraphError) rows.push(['段落错误', selection.paragraphError])
+
+  const dl = document.createElement('dl')
+  dl.className = 'meta'
+  for (const [k, v] of rows) {
+    const dt = document.createElement('dt')
+    dt.textContent = k
+    const dd = document.createElement('dd')
+    dd.textContent = v
+    dl.append(dt, dd)
+  }
+
+  const pre = document.createElement('pre')
+  pre.textContent = selection.text
+  dotDetail.append('选区原文：', pre, dl)
+
+  if (selection.rects.length > 0) {
+    const ul = document.createElement('ul')
+    ul.className = 'rects'
+    for (const r of selection.rects) {
+      const li = document.createElement('li')
+      li.textContent = `rect(${r.x}, ${r.y}, ${r.width}, ${r.height})`
+      ul.append(li)
+    }
+    dotDetail.append(`矩形区域 ×${selection.rects.length}：`, ul)
   }
 }
 
@@ -200,9 +243,14 @@ void window.api.getState().then(({ latest, history: initial }) => {
   renderHistory()
 })
 
+void window.api.getLatestDotSelection().then((selection) => {
+  if (selection) renderDotSelection(selection)
+})
+
 void window.api.getConfig().then((cfg) => {
   config = cfg
   fillConfigForm(cfg)
 })
 
 void window.api.onProbeResult((record) => applyRecord(record, true))
+void window.api.onDotSelection((selection) => renderDotSelection(selection))
