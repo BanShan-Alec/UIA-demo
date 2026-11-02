@@ -7,16 +7,18 @@
 ```
 ├── src/main/index.ts        # Electron 主进程：全局快捷键 + JSON 日志（走审计接口）
 ├── src/main/config.ts       # uia-config.json 读写（配置文件 > 环境变量 > 默认值）
-├── src/preload/index.ts     # contextBridge：onProbeResult / getState / getConfig / setConfig …
-├── src/renderer/            # 结果面板：最新划词结果 + 最近 20 条历史 + 设置
-├── src/shared/types.ts      # ProbeRecord / AppConfig（主进程与渲染进程共用）
+├── src/preload/index.ts     # contextBridge：onProbeResult / onDotSelection / getState / getConfig …
+├── src/renderer/            # 结果面板：圆点触发的选区 + 最新划词结果 + 历史 + 设置
+├── src/shared/types.ts      # ProbeRecord / DotSelection / AppConfig（主进程与渲染进程共用）
 ├── native/                  # Rust napi-rs 原生模块（workspace 成员）
 │   ├── src/lib.rs           # UIA COM 探测核心（专用 COM MTA 工作线程 + 500ms 超时）
 │   │                        #   导出 probeSelection（产品 4 字段）/ probeSelectionDetailed（审计）
 │   │                        #   / probeExpandUnits（ExpandToEnclosingUnit 审计）
+│   ├── src/dot.rs           # 原生 Win32 圆点窗口线程 + 全局鼠标钩子 + TSFN 回调
 │   └── examples/rect_probe.rs  # 无 GUI 诊断工具：枚举窗口内 TextPattern 元素，
 │                               # 编程式 Select 后dump文本/坐标（用于排查精简模式）
 ├── testpage/                # 本地测试页（常规段落 / 中英混排 / input / textarea / 跨段选区）+ sample.pdf
+├── docs/dot-trigger-spec.md # 原生圆点触发入口的交互规格与验收标准
 └── scripts/
     ├── gen-pdf.mjs          # 生成 testpage/sample.pdf
     └── expand-probe-e2e.mjs # ExpandToEnclosingUnit 自动化验证（CDP 选区 + 原生探针）
@@ -36,6 +38,25 @@ pnpm start               # electron-vite dev，日志打到控制台与 uia-prob
 启动后会同时打开一个**结果面板**窗口：显示最近一次划词结果（文本 / 目标应用 / rects / 耗时 / 错误码）、最近 20 条历史（点击回看），以及设置区。点关闭只是隐藏面板，进程和热键继续工作；按**面板热键**（默认 `Ctrl+Shift+1`）可重新唤出。
 
 设置区可调：划词热键（默认 `Ctrl+Shift+2`，点击输入框后按组合键录入）、面板热键、超时毫秒数、窗口置顶；"保存配置"即生效并写入应用根目录的 `uia-config.json`（优先级：配置文件 > `UIA_HOTKEY`/`UIA_TIMEOUT_MS` 环境变量 > 默认值）。面板上的"立即探测"按钮等价于按划词热键。
+
+## 原生 Win32 圆点触发入口（原型）
+
+`startDot` 在专用线程创建一个 8px 的原生 Win32 圆点（24px 热区）+ 全局鼠标钩子。鼠标在任意支持 UIA TextPattern 的应用里选中英文后，圆点出现在选区右下（多行选区取最后一个有效 rect，贴近鼠标结束位置）；点击圆点会读取实时选区与所在段落，打开结果面板并把数据透传过去。
+
+详细交互规格与验收标准见 [docs/dot-trigger-spec.md](docs/dot-trigger-spec.md)。
+
+```powershell
+pnpm start
+# 无前台窗口的自动化环境：用合成事件验证面板定位与渲染
+$env:UIA_DOT_SELFTEST='1'; pnpm start
+```
+
+- 圆点窗口：`WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`，常驻隐藏、复用，不抢焦点
+- 显示条件：英文占比 ≥ 30%、选区非空、非密码框、UIA 成功、排除自身进程
+- 面板已打开时再次点击新圆点：复用窗口、更新内容，并按新圆点位置移动
+- 面板正常抢焦点（本轮原型取舍）
+
+**验证边界**：`UIA_DOT_SELFTEST=1` 已验证面板卡片、面板定位与数据透传；原生窗口的创建/显示已确认。真实“鼠标划选 → 圆点 → 点击”链路需要在有前台窗口的交互式桌面里手动验证（CI/锁屏桌面下 `GetForegroundWindow()` 可能为 NULL）。
 
 启动后在 Chrome/Edge 打开任意网页（或 `testpage/index.html`），划选文字，按划词热键触发探测。每次触发输出一行 JSON：
 
@@ -80,7 +101,7 @@ pnpm start               # electron-vite dev，日志打到控制台与 uia-prob
 
 ## 产品接口 vs 审计接口
 
-原生模块导出三个函数，共用同一个 UIA worker / 500ms 超时机制：
+原生模块导出三个 probe 函数，共用同一个 UIA worker / 500ms 超时机制；另外导出 `startDot` / `stopDot` 管理原生圆点线程。
 
 **`probeSelection(timeoutMs?) → SelectionResult`** — 产品接口，划词翻译只需要这 4 个字段：
 
@@ -94,6 +115,8 @@ pnpm start               # electron-vite dev，日志打到控制台与 uia-prob
 **`probeSelectionDetailed(timeoutMs?) → ProbeResult`** — 审计接口（12 字段），仅供 PoC 验收日志使用：增加 `success`、`windowTitle`、`processId`、`focusedElement`（焦点元素类型与定位策略）、`nativeElapsedMs`（原生耗时分解）、`warnings`。字段含义见 `src/types/uia-probe.d.ts`。
 
 **`probeExpandUnits(timeoutMs?, windowTitle?) → ExpandProbeResult`** — 审计接口，仅用于 `ExpandToEnclosingUnit` 验证。它读取当前选区，分别以「选区原样」和「折叠到选区起点」两种模式，对 7 种 `TextUnit` 调用 `ExpandToEnclosingUnit`，返回每种单位的字符数、文本预览、矩形数量和 `equalsDocument`。`windowTitle` 仅用于自动化：按可见窗口标题子串定位，而不是读 `GetForegroundWindow()`（CI / 锁屏桌面没有前台窗口时必需）。
+
+**`startDot(callback) / stopDot()`** — 原生圆点线程。`callback` 在每次点击圆点时收到 `DotSelectionEvent`：`text`、`rects`、`processName`、`paragraph`、`paragraphError`、`dotRect`（物理像素）。仅在 Electron 主进程调用。
 
 原来的 `success: boolean` 在产品接口中由 `errorCode === null` 取代；`rectCount` 由 `rects.length` 取代。
 

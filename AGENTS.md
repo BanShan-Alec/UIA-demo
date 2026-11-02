@@ -14,6 +14,7 @@
   - **COM MTA 隔离与硬超时 (MTA Worker & Hard Timeout)**：UIA 跨进程 COM 调用是同步阻塞调用。项目在专用 COM MTA（多线程单元）工作线程中执行探测，配置默认 500ms 硬超时，超时自动隔离孤儿线程并启动新线程，确保主进程不被目标应用卡死。
   - **分层接口 (Two-tier API)**：提供精简产品级接口（`probeSelection`，仅 4 个字段）与审计诊断接口（`probeSelectionDetailed`，包含 12 项指标如 PID、路径、耗时分段等）。
   - **ExpandToEnclosingUnit 段落粒度验证 (Q-1)**：`probeExpandUnits` 对 7 种 `TextUnit` 做审计；`scripts/expand-probe-e2e.mjs` 在真实 Chromium 页面上断言 Paragraph 不退化成 Page/Document，并记录跨段选区的截断行为。
+  - **原生 Win32 圆点触发入口（原型）**：`startDot` 在专用线程创建 8px 原生圆点 + 全局鼠标钩子；鼠标选中英文后圆点出现在选区右下，点击读取实时选区与段落，打开结果面板并透传数据。交互规格见 `docs/dot-trigger-spec.md`。
 
 ---
 
@@ -34,9 +35,12 @@
 H:\UIA-demo\
 ├── native/                  # Rust 原生模块（UIA 核心）
 │   ├── src/lib.rs           # COM MTA 初始化、UIA 探测算法、矩形转换与 napi 导出
+│   ├── src/dot.rs           # 原生 Win32 圆点窗口线程、鼠标钩子、ThreadsafeFunction 回调
 │   ├── examples/rect_probe.rs # 命令行独立诊断工具（无 GUI，调试 TextPattern 元素与坐标）
 │   ├── Cargo.toml           # windows 0.58, napi, napi-derive 等依赖
 │   └── package.json         # napi-rs 构建配置
+├── docs/
+│   └── dot-trigger-spec.md  # 原生圆点触发入口的交互规格与验收标准
 ├── src/
 │   ├── main/                # Electron 主进程
 │   │   ├── index.ts         # 注册全局快捷键、IPC 通信、日志落盘 (uia-probe.log)
@@ -90,6 +94,12 @@ H:\UIA-demo\
   pnpm test:expand
   # 等价于 node scripts/expand-probe-e2e.mjs
   ```
+- **原生圆点原型**：
+  ```bash
+  pnpm start
+  # 无前台窗口时用合成事件验证面板定位/渲染
+  $env:UIA_DOT_SELFTEST='1'; pnpm start
+  ```
 - **代码类型检查与打包**：
   ```bash
   npm run typecheck
@@ -116,6 +126,13 @@ H:\UIA-demo\
    - `Paragraph` 精确命中选区起点所在段落，单段选区不会退化到 Page/Document；但**跨段选区会被截断到起点段**，不会保留整段选区。
    - `Page` 在网页内容上等于整个 `Document`，不能作为 Paragraph 的兜底单位。
    - Paragraph 文本末尾带 `\n`，Word 带尾随空格；CJK 的 Word 粒度是单字。
+8. **原生圆点窗口（原型）**：
+   - `native/src/dot.rs` 在专用线程创建 `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE` 的 24px 窗口，内部画 8px 圆点；窗口常驻隐藏、复用，不重复创建/销毁。
+   - 全局鼠标钩子（`WH_MOUSE_LL`）在 mouse-up 时同步调用 UIA probe（150ms 超时）；点击圆点在 `WM_LBUTTONDOWN` 里读实时选区 + 段落，再通过 `ThreadsafeFunction` 回调 Electron main。
+   - 面板正常抢焦点（本轮原型取舍）；真实鼠标选区链路需在交互式桌面手动验证，CI/锁屏桌面下 `GetForegroundWindow()` 可能为 NULL。
+   - mouse-up 全局钩子里同步 probe（150ms 超时）是原型简化；产品应把 probe 移到异步事件源，避免慢应用拖慢鼠标输入。
+   - 选区清除检测在原型里用 600ms 低频复查兜底（鼠标路径立即隐藏）；产品应改用 `UIA_Text_TextSelectionChangedEventId`。
+   - 圆点不可拖拽；只有 8px 视觉 + 24px 热区；hover 手型光标；无 tooltip、无放大。
 
 ---
 
