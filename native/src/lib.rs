@@ -21,7 +21,7 @@ use napi::{Env, Task};
 use napi_derive::napi;
 
 use windows::core::{Interface, PWSTR, VARIANT};
-use windows::Win32::Foundation::{CloseHandle, HWND};
+use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
 use windows::Win32::System::Com::{
   CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
   SAFEARRAY,
@@ -32,15 +32,21 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::{
   IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationTextRange,
-  IUIAutomationTextRangeArray, CUIAutomation, TreeScope_Descendants, UIA_DocumentControlTypeId,
+  IUIAutomationTextRangeArray, CUIAutomation, TextPatternRangeEndpoint_End,
+  TextPatternRangeEndpoint_Start, TextUnit, TextUnit_Character, TextUnit_Document,
+  TextUnit_Format, TextUnit_Line, TextUnit_Page, TextUnit_Paragraph, TextUnit_Word,
+  TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
   UIA_EditControlTypeId, UIA_IsTextPatternAvailablePropertyId, UIA_TextPatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-  GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+  EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 
 const MAX_TEXT_CHARS: usize = 10_000;
 const MAX_RECTS: usize = 4_096;
+/// Expanded unit text is a diagnostic payload, not a product return value.
+/// Cap it so a Document/Page unit cannot stuff megabytes through napi.
+const MAX_EXPAND_TEXT_CHARS: usize = 5_000;
 
 // ---------------------------------------------------------------------------
 // napi types
@@ -56,6 +62,7 @@ pub struct SelectionRect {
 }
 
 #[napi(object)]
+#[derive(Clone)]
 pub struct FocusInfo {
   pub name: String,
   pub control_type: String,
@@ -129,17 +136,115 @@ impl From<ProbeResult> for SelectionResult {
   }
 }
 
+/// One `ExpandToEnclosingUnit` measurement. The interesting field is
+/// `text_chars`: comparing it with `document_chars` reveals whether Chromium
+/// honoured the requested unit or silently degraded to a larger one.
+#[napi(object)]
+pub struct UnitProbeResult {
+  /// UIA TextUnit name: Character / Format / Word / Line / Paragraph / Page / Document.
+  pub unit: String,
+  pub unit_value: i32,
+  /// "selection" = the live GetSelection range as-is;
+  /// "collapsed-start" = the same range collapsed to its start endpoint.
+  pub mode: String,
+  /// Character count of the expanded range before transport truncation.
+  pub text_chars: u32,
+  /// First ~160 characters with line breaks escaped, for logs.
+  pub text_preview: String,
+  /// Expanded range text (truncated to MAX_EXPAND_TEXT_CHARS).
+  pub text: String,
+  pub text_truncated: bool,
+  pub rect_count: u32,
+  /// True when the expanded range covers the whole document — the degradation
+  /// signal described in the Snapword PRD (Paragraph → Page/Document).
+  pub equals_document: bool,
+  pub warnings: Vec<String>,
+}
+
+/// Result of the ExpandToEnclosingUnit probe (audit-only API).
+#[napi(object)]
+pub struct ExpandProbeResult {
+  pub success: bool,
+  pub process_name: String,
+  pub process_id: u32,
+  pub window_title: String,
+  pub focused_element: Option<FocusInfo>,
+  /// How many ranges GetSelection() returned (usually 1 in Chromium).
+  pub selection_ranges: u32,
+  pub selection_chars: u32,
+  pub selection_text: String,
+  /// DocumentRange text length — the baseline for the degradation check.
+  pub document_chars: u32,
+  pub document_preview: String,
+  pub results: Vec<UnitProbeResult>,
+  pub native_elapsed_ms: f64,
+  pub error_code: Option<String>,
+  pub error_message: Option<String>,
+  pub warnings: Vec<String>,
+}
+
+impl ExpandProbeResult {
+  fn err(code: &str, msg: impl Into<String>, start: Instant) -> Self {
+    ExpandProbeResult {
+      success: false,
+      process_name: String::new(),
+      process_id: 0,
+      window_title: String::new(),
+      focused_element: None,
+      selection_ranges: 0,
+      selection_chars: 0,
+      selection_text: String::new(),
+      document_chars: 0,
+      document_preview: String::new(),
+      results: Vec::new(),
+      native_elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+      error_code: Some(code.to_string()),
+      error_message: Some(msg.into()),
+      warnings: Vec::new(),
+    }
+  }
+
+  fn from_probe_error(err: ProbeResult, start: Instant) -> Self {
+    ExpandProbeResult {
+      success: false,
+      process_name: err.process_name,
+      process_id: err.process_id,
+      window_title: err.window_title,
+      focused_element: err.focused_element,
+      selection_ranges: 0,
+      selection_chars: 0,
+      selection_text: String::new(),
+      document_chars: 0,
+      document_preview: String::new(),
+      results: Vec::new(),
+      native_elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+      error_code: err.error_code,
+      error_message: err.error_message,
+      warnings: err.warnings,
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // dedicated UIA worker thread (COM MTA)
 // ---------------------------------------------------------------------------
 
 enum ProbeCmd {
   Probe { reply: Sender<ProbeResult> },
+  Expand {
+    reply: Sender<ExpandProbeResult>,
+    window_title: Option<String>,
+  },
+}
+
+enum WorkerError {
+  StartFailed,
+  Timeout,
+  Disconnected,
 }
 
 struct WorkerHandle {
   tx: Sender<ProbeCmd>,
-  id: u64,
 }
 
 static WORKER: OnceLock<Mutex<Option<WorkerHandle>>> = OnceLock::new();
@@ -149,11 +254,14 @@ fn worker_slot() -> &'static Mutex<Option<WorkerHandle>> {
   WORKER.get_or_init(|| Mutex::new(None))
 }
 
-/// Run one UIA probe with a hard timeout. Called from `ProbeTask::compute`
-/// (libuv thread); the actual COM work happens on the worker thread.
-fn probe_with_timeout(timeout: Duration) -> ProbeResult {
-  let start = Instant::now();
-  let (reply_tx, reply_rx) = channel::<ProbeResult>();
+/// Run one command on the shared COM MTA worker with a hard timeout. Called
+/// from a `napi::Task::compute` (libuv thread); the actual COM work happens on
+/// the worker thread.
+fn run_on_worker<T: Send + 'static>(
+  timeout: Duration,
+  make_cmd: impl Fn(Sender<T>) -> ProbeCmd,
+) -> std::result::Result<T, WorkerError> {
+  let (reply_tx, reply_rx) = channel::<T>();
 
   {
     let mut guard = worker_slot().lock().unwrap_or_else(|e| e.into_inner());
@@ -161,47 +269,83 @@ fn probe_with_timeout(timeout: Duration) -> ProbeResult {
     // with a freshly spawned worker.
     let mut sent = guard
       .as_ref()
-      .map(|w| w.tx.send(ProbeCmd::Probe { reply: reply_tx.clone() }).is_ok())
+      .map(|w| w.tx.send(make_cmd(reply_tx.clone())).is_ok())
       .unwrap_or(false);
     if !sent {
       *guard = spawn_worker();
       sent = guard
         .as_ref()
-        .map(|w| w.tx.send(ProbeCmd::Probe { reply: reply_tx.clone() }).is_ok())
+        .map(|w| w.tx.send(make_cmd(reply_tx.clone())).is_ok())
         .unwrap_or(false);
     }
     if !sent {
-      return ProbeResult::err(
-        "ComInitFailed",
-        "failed to start UIA worker thread",
-        start,
-      );
+      return Err(WorkerError::StartFailed);
     }
   }
 
   match reply_rx.recv_timeout(timeout) {
-    Ok(result) => result,
+    Ok(result) => Ok(result),
     Err(RecvTimeoutError::Timeout) => {
-      // Abandon the stuck worker; the next probe spawns a fresh one. The old
+      // Abandon the stuck worker; the next command spawns a fresh one. The old
       // thread exits on its own once its channel is disconnected.
       let mut guard = worker_slot().lock().unwrap_or_else(|e| e.into_inner());
       *guard = None;
-      ProbeResult::err(
-        "Timeout",
-        format!(
-          "UIA probe did not complete within {} ms (target app may be unresponsive)",
-          timeout.as_millis()
-        ),
-        start,
-      )
+      Err(WorkerError::Timeout)
     }
-    Err(RecvTimeoutError::Disconnected) => {
-      ProbeResult::err(
-        "ComError",
-        "UIA worker thread exited unexpectedly",
-        start,
-      )
-    }
+    Err(RecvTimeoutError::Disconnected) => Err(WorkerError::Disconnected),
+  }
+}
+
+fn probe_with_timeout(timeout: Duration) -> ProbeResult {
+  let start = Instant::now();
+  match run_on_worker(timeout, |reply| ProbeCmd::Probe { reply }) {
+    Ok(result) => result,
+    Err(WorkerError::StartFailed) => ProbeResult::err(
+      "ComInitFailed",
+      "failed to start UIA worker thread",
+      start,
+    ),
+    Err(WorkerError::Timeout) => ProbeResult::err(
+      "Timeout",
+      format!(
+        "UIA probe did not complete within {} ms (target app may be unresponsive)",
+        timeout.as_millis()
+      ),
+      start,
+    ),
+    Err(WorkerError::Disconnected) => ProbeResult::err(
+      "ComError",
+      "UIA worker thread exited unexpectedly",
+      start,
+    ),
+  }
+}
+
+fn expand_with_timeout(timeout: Duration, window_title: Option<String>) -> ExpandProbeResult {
+  let start = Instant::now();
+  match run_on_worker(timeout, |reply| ProbeCmd::Expand {
+    reply,
+    window_title: window_title.clone(),
+  }) {
+    Ok(result) => result,
+    Err(WorkerError::StartFailed) => ExpandProbeResult::err(
+      "ComInitFailed",
+      "failed to start UIA worker thread",
+      start,
+    ),
+    Err(WorkerError::Timeout) => ExpandProbeResult::err(
+      "Timeout",
+      format!(
+        "UIA expand probe did not complete within {} ms (target app may be unresponsive)",
+        timeout.as_millis()
+      ),
+      start,
+    ),
+    Err(WorkerError::Disconnected) => ExpandProbeResult::err(
+      "ComError",
+      "UIA worker thread exited unexpectedly",
+      start,
+    ),
   }
 }
 
@@ -215,53 +359,65 @@ fn spawn_worker() -> Option<WorkerHandle> {
       // clients: avoids re-entrancy deadlocks in STA callbacks).
       let com_init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
       while let Ok(cmd) = rx.recv() {
-        let ProbeCmd::Probe { reply } = cmd;
-        let result = if com_init.is_ok() {
-          unsafe { run_probe() }
-        } else {
-          ProbeResult::err(
-            "ComInitFailed",
-            format!("CoInitializeEx failed: {com_init:?}"),
-            Instant::now(),
-          )
-        };
-        let _ = reply.send(result); // receiver may be gone after a timeout — fine
+        match cmd {
+          ProbeCmd::Probe { reply } => {
+            let result = if com_init.is_ok() {
+              unsafe { run_probe() }
+            } else {
+              ProbeResult::err(
+                "ComInitFailed",
+                format!("CoInitializeEx failed: {com_init:?}"),
+                Instant::now(),
+              )
+            };
+            let _ = reply.send(result); // receiver may be gone after a timeout — fine
+          }
+          ProbeCmd::Expand { reply, window_title } => {
+            let result = if com_init.is_ok() {
+              unsafe { run_expand_probe(window_title) }
+            } else {
+              ExpandProbeResult::err(
+                "ComInitFailed",
+                format!("CoInitializeEx failed: {com_init:?}"),
+                Instant::now(),
+              )
+            };
+            let _ = reply.send(result);
+          }
+        }
       }
       unsafe {
         windows::Win32::System::Com::CoUninitialize();
       }
     });
-  spawned.ok().map(|_| WorkerHandle { tx, id })
+  spawned.ok().map(|_| WorkerHandle { tx })
 }
 
 // ---------------------------------------------------------------------------
 // the actual probe
 // ---------------------------------------------------------------------------
 
-unsafe fn run_probe() -> ProbeResult {
-  let start = Instant::now();
+/// Foreground window plus the TextPattern that reflects its live selection.
+struct Target {
+  process_name: String,
+  process_id: u32,
+  window_title: String,
+  focused_element: Option<FocusInfo>,
+  pattern: IUIAutomationTextPattern,
+}
 
-  macro_rules! fail {
-    ($code:expr, $($arg:tt)*) => {
-      return ProbeResult::err($code, format!($($arg)*), start)
-    };
-  }
-
-  // Same as `fail!` but carries the foreground-window context that was
-  // already collected (used for failures after the window was identified).
-  // A closure (not a macro) so the captured variables resolve normally.
-  let fail_ctx = |mut result: ProbeResult, code: &str, msg: String| -> ProbeResult {
-    result.success = false;
-    result.error_code = Some(code.to_string());
-    result.error_message = Some(msg);
-    result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    result
-  };
-
+/// Locate the foreground app's TextPattern. Shared by `run_probe` and
+/// `run_expand_probe` so both use exactly the same focused-element /
+/// tree-search strategy and failure codes.
+unsafe fn locate_target(start: Instant) -> std::result::Result<Target, ProbeResult> {
   // --- foreground window -------------------------------------------------
   let hwnd: HWND = GetForegroundWindow();
   if hwnd.0.is_null() {
-    fail!("NoForegroundWindow", "GetForegroundWindow returned NULL");
+    return Err(ProbeResult::err(
+      "NoForegroundWindow",
+      "GetForegroundWindow returned NULL",
+      start,
+    ));
   }
   let window_title = window_text(hwnd);
   let pid = window_pid(hwnd);
@@ -282,11 +438,28 @@ unsafe fn run_probe() -> ProbeResult {
     warnings: Vec::new(),
   };
 
+  // Same as the fail path in `run_probe`, but carries the foreground-window
+  // context that was already collected. A closure (not a macro) so the
+  // captured variables resolve normally.
+  let fail_ctx = |mut result: ProbeResult, code: &str, msg: String| -> ProbeResult {
+    result.success = false;
+    result.error_code = Some(code.to_string());
+    result.error_message = Some(msg);
+    result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    result
+  };
+
   // --- UIA client --------------------------------------------------------
   let automation: IUIAutomation =
     match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
       Ok(a) => a,
-      Err(e) => fail!("ComError", "CoCreateInstance(CLSID_CUIAutomation) failed: {e}"),
+      Err(e) => {
+        return Err(fail_ctx(
+          result,
+          "ComError",
+          format!("CoCreateInstance(CLSID_CUIAutomation) failed: {e}"),
+        ))
+      }
     };
 
   // Primary strategy: the focused element. In Chromium the document (or the
@@ -294,7 +467,13 @@ unsafe fn run_probe() -> ProbeResult {
   // selection. This is the fast path for hot calls.
   let focused: IUIAutomationElement = match automation.GetFocusedElement() {
     Ok(el) => el,
-    Err(e) => fail!("ElementNotFound", "GetFocusedElement failed: {e}"),
+    Err(e) => {
+      return Err(fail_ctx(
+        result,
+        "ElementNotFound",
+        format!("GetFocusedElement failed: {e}"),
+      ))
+    }
   };
 
   let mut focus_info = FocusInfo {
@@ -312,24 +491,36 @@ unsafe fn run_probe() -> ProbeResult {
   if pattern.is_none() {
     focus_info.via = "tree-search".into();
     let flag = VARIANT::from(true);
-    let condition = match automation.CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, &flag) {
-      Ok(c) => c,
-      Err(e) => fail!("ComError", "CreatePropertyCondition failed: {e}"),
-    };
+    let condition =
+      match automation.CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, &flag) {
+        Ok(c) => c,
+        Err(e) => {
+          return Err(fail_ctx(
+            result,
+            "ComError",
+            format!("CreatePropertyCondition failed: {e}"),
+          ))
+        }
+      };
     let root: IUIAutomationElement = match automation.ElementFromHandle(hwnd) {
       Ok(r) => r,
       Err(e) => {
-        return fail_ctx(result, "ElementNotFound", format!("ElementFromHandle(foreground) failed: {e}"))
+        return Err(fail_ctx(
+          result,
+          "ElementNotFound",
+          format!("ElementFromHandle(foreground) failed: {e}"),
+        ))
       }
     };
     match root.FindFirst(TreeScope_Descendants, &condition) {
       Ok(el) => pattern = text_pattern(&el),
       Err(_) => {
-        return fail_ctx(
+        result.focused_element = Some(focus_info);
+        return Err(fail_ctx(
           result,
           "TextPatternNotSupported",
           "no element exposing TextPattern found in foreground window (compatibility boundary, e.g. Chromium PDF viewer)".into(),
-        )
+        ));
       }
     }
   }
@@ -338,13 +529,233 @@ unsafe fn run_probe() -> ProbeResult {
   let pattern: IUIAutomationTextPattern = match pattern {
     Some(p) => p,
     None => {
-      return fail_ctx(
+      return Err(fail_ctx(
         result,
         "TextPatternNotSupported",
         "focused element does not expose TextPattern and no fallback was found".into(),
-      )
+      ))
     }
   };
+
+  Ok(Target {
+    process_name,
+    process_id: pid,
+    window_title,
+    focused_element: result.focused_element,
+    pattern,
+  })
+}
+
+struct WindowSearch {
+  needle: String,
+  found: Option<HWND>,
+}
+
+unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+  if !IsWindowVisible(hwnd).as_bool() {
+    return BOOL(1);
+  }
+  // SAFETY: EnumWindows is synchronous; the pointer stays valid for the call.
+  let search = &mut *(lparam.0 as *mut WindowSearch);
+  let title = window_text(hwnd);
+  if title.to_lowercase().contains(&search.needle) {
+    search.found = Some(hwnd);
+    return BOOL(0); // stop
+  }
+  BOOL(1)
+}
+
+/// Find a visible top-level window by title substring (case-insensitive).
+/// Used by the automated ExpandToEnclosingUnit probe, where the calling
+/// process may have no foreground window of its own.
+unsafe fn find_window_by_title(needle: &str) -> Option<HWND> {
+  let mut search = WindowSearch {
+    needle: needle.to_lowercase(),
+    found: None,
+  };
+  let _ = EnumWindows(
+    Some(enum_window_proc),
+    LPARAM(&mut search as *mut WindowSearch as isize),
+  );
+  search.found
+}
+
+/// Locate a TextPattern by window title instead of by foreground focus.
+/// Prefers ControlType=Document (the web content) and falls back to the first
+/// element exposing TextPattern.
+unsafe fn locate_target_by_title(
+  needle: &str,
+  start: Instant,
+) -> std::result::Result<Target, ProbeResult> {
+  let hwnd = match find_window_by_title(needle) {
+    Some(h) => h,
+    None => {
+      return Err(ProbeResult::err(
+        "WindowNotFound",
+        format!("no visible window title contains {needle:?}"),
+        start,
+      ))
+    }
+  };
+
+  let window_title = window_text(hwnd);
+  let pid = window_pid(hwnd);
+  let process_name = process_image_name(pid);
+
+  let mut result = ProbeResult {
+    success: false,
+    process_name: process_name.clone(),
+    process_id: pid,
+    window_title: window_title.clone(),
+    focused_element: None,
+    text: None,
+    rect_count: 0,
+    rects: Vec::new(),
+    native_elapsed_ms: 0.0,
+    error_code: None,
+    error_message: None,
+    warnings: Vec::new(),
+  };
+
+  let fail_ctx = |mut result: ProbeResult, code: &str, msg: String| -> ProbeResult {
+    result.success = false;
+    result.error_code = Some(code.to_string());
+    result.error_message = Some(msg);
+    result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    result
+  };
+
+  let automation: IUIAutomation =
+    match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+      Ok(a) => a,
+      Err(e) => {
+        return Err(fail_ctx(
+          result,
+          "ComError",
+          format!("CoCreateInstance(CLSID_CUIAutomation) failed: {e}"),
+        ))
+      }
+    };
+
+  let root: IUIAutomationElement = match automation.ElementFromHandle(hwnd) {
+    Ok(r) => r,
+    Err(e) => {
+      return Err(fail_ctx(
+        result,
+        "ElementNotFound",
+        format!("ElementFromHandle(title match) failed: {e}"),
+      ))
+    }
+  };
+
+  let mut focus_info = FocusInfo {
+    name: truncate(window_title.clone(), 120),
+    control_type: "Window".into(),
+    via: "window-title".into(),
+    process_id: pid,
+  };
+
+  let mut pattern = None;
+
+  // First choice: the web document, which owns the live selection.
+  if let Ok(doc_cond) = automation.CreatePropertyCondition(
+    UIA_ControlTypePropertyId,
+    &VARIANT::from(UIA_DocumentControlTypeId.0),
+  ) {
+    if let Ok(doc) = root.FindFirst(TreeScope_Descendants, &doc_cond) {
+      if !doc.as_raw().is_null() {
+        focus_info.name = truncate(el_name(&doc), 120);
+        focus_info.control_type = control_type_name(&doc);
+        focus_info.process_id = el_pid(&doc);
+        pattern = text_pattern(&doc);
+      }
+    }
+  }
+
+  // Fallback: any element exposing TextPattern.
+  if pattern.is_none() {
+    let flag = VARIANT::from(true);
+    let condition =
+      match automation.CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, &flag) {
+        Ok(c) => c,
+        Err(e) => {
+          return Err(fail_ctx(
+            result,
+            "ComError",
+            format!("CreatePropertyCondition failed: {e}"),
+          ))
+        }
+      };
+    match root.FindFirst(TreeScope_Descendants, &condition) {
+      Ok(el) => {
+        focus_info.name = truncate(el_name(&el), 120);
+        focus_info.control_type = control_type_name(&el);
+        focus_info.process_id = el_pid(&el);
+        pattern = text_pattern(&el);
+      }
+      Err(_) => {
+        result.focused_element = Some(focus_info);
+        return Err(fail_ctx(
+          result,
+          "TextPatternNotSupported",
+          "no element exposing TextPattern found in the title-matched window".into(),
+        ));
+      }
+    }
+  }
+
+  result.focused_element = Some(focus_info);
+  let pattern: IUIAutomationTextPattern = match pattern {
+    Some(p) => p,
+    None => {
+      return Err(fail_ctx(
+        result,
+        "TextPatternNotSupported",
+        "title-matched window has no TextPattern-capable element".into(),
+      ))
+    }
+  };
+
+  Ok(Target {
+    process_name,
+    process_id: pid,
+    window_title,
+    focused_element: result.focused_element,
+    pattern,
+  })
+}
+
+unsafe fn run_probe() -> ProbeResult {
+  let start = Instant::now();
+  let target = match locate_target(start) {
+    Ok(t) => t,
+    Err(e) => return e,
+  };
+
+  let mut result = ProbeResult {
+    success: false,
+    process_name: target.process_name,
+    process_id: target.process_id,
+    window_title: target.window_title,
+    focused_element: target.focused_element,
+    text: None,
+    rect_count: 0,
+    rects: Vec::new(),
+    native_elapsed_ms: 0.0,
+    error_code: None,
+    error_message: None,
+    warnings: Vec::new(),
+  };
+
+  let fail_ctx = |mut result: ProbeResult, code: &str, msg: String| -> ProbeResult {
+    result.success = false;
+    result.error_code = Some(code.to_string());
+    result.error_message = Some(msg);
+    result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    result
+  };
+
+  let pattern = target.pattern;
 
   // --- selection ---------------------------------------------------------
   let selection: IUIAutomationTextRangeArray = match pattern.GetSelection() {
@@ -414,6 +825,249 @@ unsafe fn run_probe() -> ProbeResult {
   result.rects = rects;
   result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
   result
+}
+
+// ---------------------------------------------------------------------------
+// ExpandToEnclosingUnit probe (audit-only)
+// ---------------------------------------------------------------------------
+
+/// Expand the live selection with every UIA TextUnit, in two modes:
+///
+/// * `selection`       — the GetSelection() range exactly as selected
+/// * `collapsed-start` — the same range collapsed to its start endpoint
+///                        (the workflow for "paragraph containing the start
+///                        of the selection")
+///
+/// `ExpandToEnclosingUnit` normalizes a range to the smallest enclosing unit;
+/// it never shrinks a range that is already larger than the unit. Comparing
+/// each result's character count with the document length exposes silent
+/// degradation to Page/Document (the Snapword PRD's Q-1 risk).
+unsafe fn run_expand_probe(window_title: Option<String>) -> ExpandProbeResult {
+  let start = Instant::now();
+  let target = match window_title {
+    Some(title) => locate_target_by_title(&title, start),
+    None => locate_target(start),
+  };
+  let target = match target {
+    Ok(t) => t,
+    Err(e) => return ExpandProbeResult::from_probe_error(e, start),
+  };
+
+  let mut result = ExpandProbeResult {
+    success: false,
+    process_name: target.process_name,
+    process_id: target.process_id,
+    window_title: target.window_title,
+    focused_element: target.focused_element,
+    selection_ranges: 0,
+    selection_chars: 0,
+    selection_text: String::new(),
+    document_chars: 0,
+    document_preview: String::new(),
+    results: Vec::new(),
+    native_elapsed_ms: 0.0,
+    error_code: None,
+    error_message: None,
+    warnings: Vec::new(),
+  };
+
+  let fail_ctx = |mut result: ExpandProbeResult, code: &str, msg: String| -> ExpandProbeResult {
+    result.success = false;
+    result.error_code = Some(code.to_string());
+    result.error_message = Some(msg);
+    result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    result
+  };
+
+  let pattern = target.pattern;
+
+  // Baseline: the whole document the TextPattern exposes.
+  let document_range = match pattern.DocumentRange() {
+    Ok(r) => r,
+    Err(e) => {
+      return fail_ctx(
+        result,
+        "NoDocumentRange",
+        format!("DocumentRange() failed: {e}"),
+      )
+    }
+  };
+  let document_text = match document_range.GetText(-1) {
+    Ok(t) => t.to_string(),
+    Err(e) => {
+      return fail_ctx(
+        result,
+        "DocumentTextFailed",
+        format!("DocumentRange.GetText failed: {e}"),
+      )
+    }
+  };
+  result.document_chars = document_text.chars().count() as u32;
+  result.document_preview = preview(&document_text, 160);
+
+  // The live selection is the same range the product probe reads.
+  let selection = match pattern.GetSelection() {
+    Ok(s) => s,
+    Err(e) => {
+      return fail_ctx(
+        result,
+        "EmptySelection",
+        format!("GetSelection() failed (usually: no active selection): {e}"),
+      )
+    }
+  };
+  let range_count = selection.Length().unwrap_or(0);
+  result.selection_ranges = range_count as u32;
+  if range_count <= 0 {
+    return fail_ctx(
+      result,
+      "EmptySelection",
+      "GetSelection() returned 0 ranges (caret only, no highlighted text)".into(),
+    );
+  }
+
+  let selection_range: IUIAutomationTextRange = match selection.GetElement(0) {
+    Ok(r) => r,
+    Err(e) => {
+      return fail_ctx(
+        result,
+        "EmptySelection",
+        format!("GetElement(0) failed: {e}"),
+      )
+    }
+  };
+  let selection_text = match selection_range.GetText(-1) {
+    Ok(t) => t.to_string(),
+    Err(e) => {
+      return fail_ctx(
+        result,
+        "EmptySelection",
+        format!("selection GetText failed: {e}"),
+      )
+    }
+  };
+  result.selection_chars = selection_text.chars().count() as u32;
+  result.selection_text = cap_expand_text(&selection_text);
+
+  // Two starting points: as-selected, and collapsed to the start endpoint.
+  let mut bases: Vec<(&str, IUIAutomationTextRange)> =
+    vec![("selection", selection_range.clone())];
+  match selection_range.Clone() {
+    Ok(collapsed) => match collapsed.MoveEndpointByRange(
+      TextPatternRangeEndpoint_End,
+      &selection_range,
+      TextPatternRangeEndpoint_Start,
+    ) {
+      Ok(()) => bases.push(("collapsed-start", collapsed)),
+      Err(e) => result
+        .warnings
+        .push(format!("collapsed-start mode unavailable: {e}")),
+    },
+    Err(e) => result
+      .warnings
+      .push(format!("collapsed-start clone failed: {e}")),
+  }
+
+  const UNITS: [(&str, TextUnit); 7] = [
+    ("Character", TextUnit_Character),
+    ("Format", TextUnit_Format),
+    ("Word", TextUnit_Word),
+    ("Line", TextUnit_Line),
+    ("Paragraph", TextUnit_Paragraph),
+    ("Page", TextUnit_Page),
+    ("Document", TextUnit_Document),
+  ];
+
+  for (mode, base) in &bases {
+    for (unit_name, unit) in UNITS {
+      match expand_unit(base, unit, &document_text) {
+        Ok(mut item) => {
+          item.mode = (*mode).to_string();
+          item.unit = unit_name.to_string();
+          result.results.push(item);
+        }
+        Err(e) => result
+          .warnings
+          .push(format!("{mode}/{unit_name}: {e}")),
+      }
+    }
+  }
+
+  result.success = !result.results.is_empty();
+  result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+  result
+}
+
+/// Clone the base range, expand it to `unit`, and measure the result. The
+/// clone is essential: ExpandToEnclosingUnit mutates the receiver.
+unsafe fn expand_unit(
+  base: &IUIAutomationTextRange,
+  unit: TextUnit,
+  document_text: &str,
+) -> std::result::Result<UnitProbeResult, String> {
+  let range = base.Clone().map_err(|e| format!("Clone failed: {e}"))?;
+  range
+    .ExpandToEnclosingUnit(unit)
+    .map_err(|e| format!("ExpandToEnclosingUnit failed: {e}"))?;
+  let text = range
+    .GetText(-1)
+    .map_err(|e| format!("GetText failed: {e}"))?
+    .to_string();
+  let text_char_count = text.chars().count();
+
+  let mut warnings = Vec::new();
+  let rect_count = match range.GetBoundingRectangles() {
+    Ok(sa_ptr) => match parse_rect_safearray(sa_ptr) {
+      Ok(rects) => rects.len() as u32,
+      Err(msg) => {
+        warnings.push(format!("bounding rectangles unavailable: {msg}"));
+        0
+      }
+    },
+    Err(e) => {
+      warnings.push(format!("GetBoundingRectangles failed: {e}"));
+      0
+    }
+  };
+
+  Ok(UnitProbeResult {
+    unit: String::new(),
+    unit_value: unit.0,
+    mode: String::new(),
+    text_chars: text_char_count as u32,
+    text_preview: preview(&text, 160),
+    text: cap_expand_text(&text),
+    text_truncated: text_char_count > MAX_EXPAND_TEXT_CHARS,
+    rect_count,
+    equals_document: text == document_text,
+    warnings,
+  })
+}
+
+fn cap_expand_text(s: &str) -> String {
+  if s.chars().count() <= MAX_EXPAND_TEXT_CHARS {
+    s.to_string()
+  } else {
+    s.chars().take(MAX_EXPAND_TEXT_CHARS).collect()
+  }
+}
+
+/// Log-friendly one-line preview: control characters are escaped so a whole
+/// paragraph stays on one line in the JSON log / console.
+fn preview(s: &str, max_chars: usize) -> String {
+  let mut out = String::new();
+  for ch in s.chars().take(max_chars) {
+    match ch {
+      '\r' => out.push_str("\\r"),
+      '\n' => out.push_str("\\n"),
+      '\t' => out.push_str("\\t"),
+      c => out.push(c),
+    }
+  }
+  if s.chars().count() > max_chars {
+    out.push('…');
+  }
+  out
 }
 
 // ---------------------------------------------------------------------------
@@ -603,4 +1257,47 @@ pub fn probe_selection(timeout_ms: Option<u32>) -> AsyncTask<ProbeTask> {
 #[napi(ts_return_type = "Promise<ProbeResult>")]
 pub fn probe_selection_detailed(timeout_ms: Option<u32>) -> AsyncTask<ProbeTaskDetailed> {
   AsyncTask::new(ProbeTaskDetailed { timeout_ms: timeout_ms.unwrap_or(500) })
+}
+
+pub struct ExpandTask {
+  pub timeout_ms: u32,
+  pub window_title: Option<String>,
+}
+
+impl Task for ExpandTask {
+  type Output = ExpandProbeResult;
+  type JsValue = ExpandProbeResult;
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    Ok(expand_with_timeout(
+      Duration::from_millis(self.timeout_ms as u64),
+      self.window_title.clone(),
+    ))
+  }
+
+  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+    Ok(output)
+  }
+}
+
+/// Measure `ExpandToEnclosingUnit` for every UIA TextUnit on the live
+/// selection. Audit-only: not part of the product interface.
+///
+/// Use it to verify the Snapword Q-1 question: does requesting Paragraph
+/// return exactly the enclosing paragraph, or does Chromium silently degrade
+/// to Page/Document (which would make the whole-page-to-LLM risk real)?
+///
+/// `windowTitle` is optional and only for automation: when present the probe
+/// finds a visible top-level window by title substring instead of reading
+/// `GetForegroundWindow`. Useful in test runners that have no foreground
+/// window of their own. Omit it for the normal hotkey path.
+#[napi(ts_return_type = "Promise<ExpandProbeResult>")]
+pub fn probe_expand_units(
+  timeout_ms: Option<u32>,
+  window_title: Option<String>,
+) -> AsyncTask<ExpandTask> {
+  AsyncTask::new(ExpandTask {
+    timeout_ms: timeout_ms.unwrap_or(500),
+    window_title,
+  })
 }

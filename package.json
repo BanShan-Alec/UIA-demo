@@ -9,7 +9,8 @@
     "start": "electron-vite dev",
     "build": "electron-vite build",
     "build:native": "node scripts/build-native.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:expand": "node scripts/expand-probe-e2e.mjs"
   },
   "dependencies": {
     "uia-probe": "workspace:*"

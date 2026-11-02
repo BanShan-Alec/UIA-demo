@@ -42,8 +42,55 @@ declare module 'uia-probe' {
     warnings: string[]
   }
 
+  /** One `ExpandToEnclosingUnit` measurement. */
+  export interface UnitProbeResult {
+    /** Character / Format / Word / Line / Paragraph / Page / Document */
+    unit: string
+    unitValue: number
+    /** "selection" = live selection as-is; "collapsed-start" = collapsed to its start. */
+    mode: string
+    /** Character count of the expanded range before transport truncation. */
+    textChars: number
+    /** First ~160 chars with line breaks escaped, for logs. */
+    textPreview: string
+    /** Expanded range text (truncated to 5000 chars). */
+    text: string
+    textTruncated: boolean
+    rectCount: number
+    /** True when the expanded range covers the whole document (degradation signal). */
+    equalsDocument: boolean
+    warnings: string[]
+  }
+
+  /** Audit-only result of probeExpandUnits. */
+  export interface ExpandProbeResult {
+    success: boolean
+    processName: string
+    processId: number
+    windowTitle: string
+    focusedElement: FocusInfo | null
+    selectionRanges: number
+    selectionChars: number
+    selectionText: string
+    /** DocumentRange text length — baseline for the degradation check. */
+    documentChars: number
+    documentPreview: string
+    results: UnitProbeResult[]
+    nativeElapsedMs: number
+    errorCode: string | null
+    errorMessage: string | null
+    warnings: string[]
+  }
+
   /** Product call. errorCode null = success. */
   export function probeSelection(timeoutMs?: number): Promise<SelectionResult>
   /** Audit call (full fields) — used by the PoC log path. */
   export function probeSelectionDetailed(timeoutMs?: number): Promise<ProbeResult>
+  /** Audit call: ExpandToEnclosingUnit measurements for the live selection.
+   *  `windowTitle` is automation-only: find a visible window by title substring
+   *  instead of using GetForegroundWindow. */
+  export function probeExpandUnits(
+    timeoutMs?: number,
+    windowTitle?: string
+  ): Promise<ExpandProbeResult>
 }

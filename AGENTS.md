@@ -13,6 +13,7 @@
   - **物理像素逐行矩形 (Bounding Rectangles)**：不仅提取选中文本，同时获取每一行在屏幕上的绝对物理像素包围盒（DPI 感知），为悬浮划词气泡、取词工具栏提供像素级精确定位。
   - **COM MTA 隔离与硬超时 (MTA Worker & Hard Timeout)**：UIA 跨进程 COM 调用是同步阻塞调用。项目在专用 COM MTA（多线程单元）工作线程中执行探测，配置默认 500ms 硬超时，超时自动隔离孤儿线程并启动新线程，确保主进程不被目标应用卡死。
   - **分层接口 (Two-tier API)**：提供精简产品级接口（`probeSelection`，仅 4 个字段）与审计诊断接口（`probeSelectionDetailed`，包含 12 项指标如 PID、路径、耗时分段等）。
+  - **ExpandToEnclosingUnit 段落粒度验证 (Q-1)**：`probeExpandUnits` 对 7 种 `TextUnit` 做审计；`scripts/expand-probe-e2e.mjs` 在真实 Chromium 页面上断言 Paragraph 不退化成 Page/Document，并记录跨段选区的截断行为。
 
 ---
 
@@ -54,7 +55,8 @@ H:\UIA-demo\
 │   └── sample.pdf           # 用于测试 Edge/Chrome 内置 PDF 插件取词边界的样本文件
 ├── scripts/                 # 构建与辅助脚本
 │   ├── build-native.mjs     # 编译 Rust 原生模块并移动 .node 文件
-│   └── gen-pdf.mjs          # 生成测试用 PDF 文件
+│   ├── gen-pdf.mjs          # 生成测试用 PDF 文件
+│   └── expand-probe-e2e.mjs # ExpandToEnclosingUnit 自动化验证（CDP 选区 + 原生探针）
 ├── uia-config.json          # 本地持久化配置（热键、超时时间等，存在默认降级）
 ├── uia-probe.log            # 运行日志（每次探测的耗时与结果 JSON）
 └── README.md                # 完整的技术调研报告、场景兼容矩阵与实测耗时数据
@@ -83,6 +85,11 @@ H:\UIA-demo\
   ```bash
   cargo run --manifest-path native/Cargo.toml --example rect_probe
   ```
+- **ExpandToEnclosingUnit 自动化验证**（默认 Chrome；支持 `--browser edge`、`--url`、`--selector`）：
+  ```bash
+  pnpm test:expand
+  # 等价于 node scripts/expand-probe-e2e.mjs
+  ```
 - **代码类型检查与打包**：
   ```bash
   npm run typecheck
@@ -103,6 +110,12 @@ H:\UIA-demo\
    - UIA 返回的 `BoundingRectangles` 为系统**物理像素**（Physical Pixels）。前端若要在 CSS 逻辑像素下精确定位浮窗，需考虑屏幕的 `devicePixelRatio` 缩放换算。
 5. **PDF 阅读器支持限制**：
    - Chrome / Edge 内置的 PDF Viewer 使用了独立的虚拟渲染管线，通常不暴露标准的 TextPattern 选区，属于已知的兼容边界。
+6. **Chromium 无障碍树激活（自动化前提）**：
+   - 默认精简模式下，UIA 顶层窗口树只有地址栏等浏览器 UI，看不到网页 Document。自动化探针必须同时具备：`--force-renderer-accessibility` 启动参数、CDP `Emulation.setFocusEmulationEnabled`、页面内真实点击（`Input.dispatchMouseEvent`）；缺一不可。`scripts/expand-probe-e2e.mjs` 已封装这三步。
+7. **ExpandToEnclosingUnit 的真实语义（Chrome/Edge 156 实测）**：
+   - `Paragraph` 精确命中选区起点所在段落，单段选区不会退化到 Page/Document；但**跨段选区会被截断到起点段**，不会保留整段选区。
+   - `Page` 在网页内容上等于整个 `Document`，不能作为 Paragraph 的兜底单位。
+   - Paragraph 文本末尾带 `\n`，Word 带尾随空格；CJK 的 Word 粒度是单字。
 
 ---
 
