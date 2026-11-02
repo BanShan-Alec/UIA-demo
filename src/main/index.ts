@@ -1,9 +1,9 @@
-import { app, BrowserWindow, globalShortcut, ipcMain } from 'electron'
+import { app, BrowserWindow, globalShortcut, ipcMain, screen } from 'electron'
 import { appendFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { probeSelectionDetailed } from 'uia-probe'
-import type { ProbeResult } from 'uia-probe'
-import type { AppConfig, ProbeRecord, SetConfigResult } from '../shared/types'
+import { probeSelectionDetailed, startDot, stopDot } from 'uia-probe'
+import type { DotSelectionEvent, ProbeResult } from 'uia-probe'
+import type { AppConfig, DotSelection, ProbeRecord, SetConfigResult } from '../shared/types'
 import { loadConfig, saveConfig } from './config'
 
 // Product code only needs the 4-field interface:
@@ -22,6 +22,7 @@ let inFlight = false
 let history: ProbeRecord[] = []
 let win: BrowserWindow | null = null
 let quitting = false
+let latestDotSelection: DotSelection | null = null
 
 type Trigger = 'hotkey' | 'selftest' | 'manual'
 
@@ -154,6 +155,61 @@ function togglePanel(): void {
   }
 }
 
+// ---- native dot -------------------------------------------------------------
+
+/**
+ * Open (or reuse) the panel for a dot click and move it next to the dot.
+ *
+ * The dot event carries physical pixels; Electron's window APIs use DIP, so
+ * both corners are converted independently. Layout follows the dot spec:
+ * panel left = dot right + 8, panel vertical center = dot center; flip to the
+ * left when the right side has no room, then clamp to the display work area.
+ */
+function showPanelForDot(event: DotSelectionEvent): void {
+  latestDotSelection = event
+  if (!win) createWindow()
+  if (!win) return
+
+  const topLeft = screen.screenToDipPoint({
+    x: Math.round(event.dotRect.x),
+    y: Math.round(event.dotRect.y)
+  })
+  const bottomRight = screen.screenToDipPoint({
+    x: Math.round(event.dotRect.x + event.dotRect.width),
+    y: Math.round(event.dotRect.y + event.dotRect.height)
+  })
+  const dotWidth = bottomRight.x - topLeft.x
+  const dotHeight = bottomRight.y - topLeft.y
+
+  const display = screen.getDisplayNearestPoint({
+    x: Math.round(topLeft.x),
+    y: Math.round(topLeft.y)
+  })
+  const workArea = display.workArea
+  const [panelWidth, panelHeight] = win.getSize()
+
+  let x = bottomRight.x + 8
+  if (x + panelWidth > workArea.x + workArea.width) {
+    x = topLeft.x - 8 - panelWidth
+  }
+  let y = topLeft.y + dotHeight / 2 - panelHeight / 2
+  x = Math.max(workArea.x, Math.min(x, workArea.x + workArea.width - panelWidth))
+  y = Math.max(workArea.y, Math.min(y, workArea.y + workArea.height - panelHeight))
+
+  win.setPosition(Math.round(x), Math.round(y), false)
+  if (!win.isVisible()) win.show()
+  win.focus()
+
+  const send = (): void => {
+    win?.webContents.send('dot:selection', event)
+  }
+  if (win.webContents.isLoading()) {
+    win.webContents.once('did-finish-load', send)
+  } else {
+    send()
+  }
+}
+
 // ---- hotkey registration / config -------------------------------------------
 
 function registerHotkeys(): { hotkey: boolean; panelHotkey: boolean } {
@@ -197,6 +253,7 @@ function applyConfig(next: AppConfig): SetConfigResult {
 // ---- IPC ---------------------------------------------------------------------
 
 ipcMain.handle('probe:getState', () => ({ latest: history[0] ?? null, history }))
+ipcMain.handle('dot:getLatest', () => latestDotSelection)
 ipcMain.handle('config:get', () => config)
 ipcMain.handle('config:set', (_e, patch: Partial<AppConfig>) => {
   const clamp = (v: unknown, fallback: number): number => {
@@ -217,6 +274,13 @@ app.disableHardwareAcceleration()
 
 app.whenReady().then(() => {
   createWindow()
+
+  try {
+    startDot((event) => showPanelForDot(event))
+    emit('info', { msg: 'native dot started' })
+  } catch (error) {
+    emit('error', { msg: `failed to start native dot: ${String(error)}` })
+  }
 
   const registered = registerHotkeys()
 
@@ -253,10 +317,30 @@ app.whenReady().then(() => {
     }
     setTimeout(run, 800)
   }
+
+  // Optional dot -> panel layout test:
+  //   UIA_DOT_SELFTEST=1 electron .
+  if (process.env.UIA_DOT_SELFTEST === '1') {
+    setTimeout(() => {
+      showPanelForDot({
+        text: 'dot selftest: native dot -> panel',
+        rects: [{ x: 400, y: 300, width: 180, height: 24 }],
+        processName: 'selftest.exe',
+        paragraph: 'This is a fake paragraph used to verify panel placement.',
+        paragraphError: null,
+        dotRect: { x: 588, y: 332, width: 24, height: 24 }
+      })
+    }, 1200)
+  }
 })
 
 app.on('before-quit', () => {
   quitting = true
+  try {
+    stopDot()
+  } catch {
+    /* best effort: process exit will tear down the dot thread anyway */
+  }
 })
 
 app.on('will-quit', () => globalShortcut.unregisterAll())
