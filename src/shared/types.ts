@@ -38,3 +38,14 @@ export interface SetConfigResult {
   config: AppConfig
   error?: string
 }
+
+/** Payload passed from the native Win32 dot to the result panel. */
+export interface DotSelection {
+  text: string
+  rects: SelectionRect[]
+  processName: string
+  paragraph: string | null
+  paragraphError: string | null
+  /** Dot window rectangle in absolute physical pixels. */
+  dotRect: SelectionRect
+}

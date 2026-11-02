@@ -82,6 +82,17 @@ declare module 'uia-probe' {
     warnings: string[]
   }
 
+  /** Event emitted when the native dot is clicked. */
+  export interface DotSelectionEvent {
+    text: string
+    rects: SelectionRect[]
+    processName: string
+    paragraph: string | null
+    paragraphError: string | null
+    /** Dot window rectangle in absolute physical pixels. */
+    dotRect: SelectionRect
+  }
+
   /** Product call. errorCode null = success. */
   export function probeSelection(timeoutMs?: number): Promise<SelectionResult>
   /** Audit call (full fields) — used by the PoC log path. */
@@ -93,4 +104,8 @@ declare module 'uia-probe' {
     timeoutMs?: number,
     windowTitle?: string
   ): Promise<ExpandProbeResult>
+  /** Start the native Win32 dot thread. The callback runs once per dot click. */
+  export function startDot(callback: (event: DotSelectionEvent) => void): void
+  /** Stop the native dot thread (call on app quit). */
+  export function stopDot(): void
 }
