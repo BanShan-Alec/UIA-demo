@@ -11,6 +11,7 @@
 //!   all — UIA reads the selection out-of-process, so the clipboard cannot be
 //!   affected by design.
 
+use std::cell::RefCell;
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}};
 use std::thread;
@@ -21,7 +22,7 @@ use napi::{Env, Task};
 use napi_derive::napi;
 
 use windows::core::{Interface, PWSTR, VARIANT};
-use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
+use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, POINT};
 use windows::Win32::System::Com::{
   CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
   SAFEARRAY,
@@ -57,7 +58,12 @@ const MAX_EXPAND_TEXT_CHARS: usize = 5_000;
 #[napi(object)]
 #[derive(Clone)]
 pub struct SelectionRect {
-  /// Absolute screen coordinate (physical pixels) of the line fragment.
+  /// Absolute screen coordinate of the line fragment.
+  ///
+  /// Not guaranteed to be physical pixels: Chrome/Edge 156 at 175% DPI
+  /// returned screen CSS pixels for most D-1 samples. Normalize against
+  /// `devicePixelRatio` (or detect the space) before using the rect for
+  /// window positioning.
   pub x: f64,
   pub y: f64,
   pub width: f64,
@@ -228,6 +234,70 @@ impl ExpandProbeResult {
   }
 }
 
+/// Result of the `RangeFromPoint` probe (Q-6 audit-only API).
+///
+/// `word` is the result of expanding the point range to a Word unit — the
+/// fallback path for "translate the word under the cursor when UIA cannot
+/// return a live selection". `text` is the unexpanded range text at the point.
+#[napi(object)]
+pub struct RangeProbeResult {
+  pub success: bool,
+  pub process_name: String,
+  pub process_id: u32,
+  pub window_title: String,
+  /// Element returned by `ElementFromPoint`, if available.
+  pub element_name: String,
+  pub element_control_type: String,
+  /// "element-from-point" or "target-pattern".
+  pub via: String,
+  /// Text of the degenerate range at the point.
+  pub text: String,
+  /// Word enclosing the point (after `ExpandToEnclosingUnit(Word)`).
+  pub word: String,
+  pub native_elapsed_ms: f64,
+  pub error_code: Option<String>,
+  pub error_message: Option<String>,
+  pub warnings: Vec<String>,
+}
+
+impl RangeProbeResult {
+  fn err(code: &str, msg: impl Into<String>, start: Instant) -> Self {
+    RangeProbeResult {
+      success: false,
+      process_name: String::new(),
+      process_id: 0,
+      window_title: String::new(),
+      element_name: String::new(),
+      element_control_type: String::new(),
+      via: String::new(),
+      text: String::new(),
+      word: String::new(),
+      native_elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+      error_code: Some(code.to_string()),
+      error_message: Some(msg.into()),
+      warnings: Vec::new(),
+    }
+  }
+
+  fn from_probe_error(err: ProbeResult, start: Instant) -> Self {
+    RangeProbeResult {
+      success: false,
+      process_name: err.process_name,
+      process_id: err.process_id,
+      window_title: err.window_title,
+      element_name: String::new(),
+      element_control_type: String::new(),
+      via: String::new(),
+      text: String::new(),
+      word: String::new(),
+      native_elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+      error_code: err.error_code,
+      error_message: err.error_message,
+      warnings: err.warnings,
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // dedicated UIA worker thread (COM MTA)
 // ---------------------------------------------------------------------------
@@ -238,6 +308,10 @@ enum ProbeCmd {
     hwnd: isize,
     reply: Sender<ProbeResult>,
   },
+  ProbeTitle {
+    window_title: String,
+    reply: Sender<ProbeResult>,
+  },
   Expand {
     reply: Sender<ExpandProbeResult>,
     window_title: Option<String>,
@@ -245,6 +319,12 @@ enum ProbeCmd {
   ExpandWindow {
     hwnd: isize,
     reply: Sender<ExpandProbeResult>,
+  },
+  Range {
+    x: f64,
+    y: f64,
+    window_title: Option<String>,
+    reply: Sender<RangeProbeResult>,
   },
 }
 
@@ -360,6 +440,72 @@ fn expand_with_timeout(timeout: Duration, window_title: Option<String>) -> Expan
   }
 }
 
+/// Audit-only selection probe that targets a window by title instead of
+/// `GetForegroundWindow()`. Used by automated D-1 runs where the test runner
+/// may not own the foreground window.
+fn probe_with_timeout_title(timeout: Duration, window_title: String) -> ProbeResult {
+  let start = Instant::now();
+  match run_on_worker(timeout, |reply| ProbeCmd::ProbeTitle {
+    reply,
+    window_title: window_title.clone(),
+  }) {
+    Ok(result) => result,
+    Err(WorkerError::StartFailed) => ProbeResult::err(
+      "ComInitFailed",
+      "failed to start UIA worker thread",
+      start,
+    ),
+    Err(WorkerError::Timeout) => ProbeResult::err(
+      "Timeout",
+      format!(
+        "UIA probe did not complete within {} ms (target app may be unresponsive)",
+        timeout.as_millis()
+      ),
+      start,
+    ),
+    Err(WorkerError::Disconnected) => ProbeResult::err(
+      "ComError",
+      "UIA worker thread exited unexpectedly",
+      start,
+    ),
+  }
+}
+
+fn range_with_timeout(
+  timeout: Duration,
+  x: f64,
+  y: f64,
+  window_title: Option<String>,
+) -> RangeProbeResult {
+  let start = Instant::now();
+  match run_on_worker(timeout, |reply| ProbeCmd::Range {
+    x,
+    y,
+    window_title: window_title.clone(),
+    reply,
+  }) {
+    Ok(result) => result,
+    Err(WorkerError::StartFailed) => RangeProbeResult::err(
+      "ComInitFailed",
+      "failed to start UIA worker thread",
+      start,
+    ),
+    Err(WorkerError::Timeout) => RangeProbeResult::err(
+      "Timeout",
+      format!(
+        "RangeFromPoint probe did not complete within {} ms (target app may be unresponsive)",
+        timeout.as_millis()
+      ),
+      start,
+    ),
+    Err(WorkerError::Disconnected) => RangeProbeResult::err(
+      "ComError",
+      "UIA worker thread exited unexpectedly",
+      start,
+    ),
+  }
+}
+
 /// Dot-trigger path: read the live selection from a specific target window.
 /// Used by the native dot thread at mouse-up and at click time.
 pub(crate) fn probe_selection_for_window_sync(
@@ -453,6 +599,18 @@ fn spawn_worker() -> Option<WorkerHandle> {
             };
             let _ = reply.send(result);
           }
+          ProbeCmd::ProbeTitle { window_title, reply } => {
+            let result = if com_init.is_ok() {
+              unsafe { run_probe_for_title(&window_title) }
+            } else {
+              ProbeResult::err(
+                "ComInitFailed",
+                format!("CoInitializeEx failed: {com_init:?}"),
+                Instant::now(),
+              )
+            };
+            let _ = reply.send(result);
+          }
           ProbeCmd::Expand { reply, window_title } => {
             let result = if com_init.is_ok() {
               let target = match window_title {
@@ -481,6 +639,23 @@ fn spawn_worker() -> Option<WorkerHandle> {
             };
             let _ = reply.send(result);
           }
+          ProbeCmd::Range {
+            x,
+            y,
+            window_title,
+            reply,
+          } => {
+            let result = if com_init.is_ok() {
+              unsafe { run_range_probe(x, y, window_title) }
+            } else {
+              RangeProbeResult::err(
+                "ComInitFailed",
+                format!("CoInitializeEx failed: {com_init:?}"),
+                Instant::now(),
+              )
+            };
+            let _ = reply.send(result);
+          }
         }
       }
       unsafe {
@@ -495,12 +670,59 @@ fn spawn_worker() -> Option<WorkerHandle> {
 // ---------------------------------------------------------------------------
 
 /// Foreground window plus the TextPattern that reflects its live selection.
+#[derive(Clone)]
 struct Target {
   process_name: String,
   process_id: u32,
   window_title: String,
   focused_element: Option<FocusInfo>,
   pattern: IUIAutomationTextPattern,
+}
+
+/// Short-lived cache for the title-based automation path. Locating the
+/// TextPattern (EnumWindows + FindAll over the accessibility tree) costs
+/// 15–60 ms; the pattern object itself stays valid while the user changes the
+/// selection. The product hotkey path uses the foreground window and does not
+/// use this cache.
+struct CachedTarget {
+  window_title: String,
+  target: Target,
+  cached_at: Instant,
+}
+
+thread_local! {
+  static TITLE_CACHE: RefCell<Option<CachedTarget>> = RefCell::new(None);
+}
+
+fn cached_target_for_title(window_title: &str) -> Option<Target> {
+  TITLE_CACHE.with(|cell| {
+    let cache = cell.borrow();
+    match cache.as_ref() {
+      Some(entry)
+        if entry.window_title == window_title
+          && entry.cached_at.elapsed() < Duration::from_secs(5) =>
+      {
+        Some(entry.target.clone())
+      }
+      _ => None,
+    }
+  })
+}
+
+fn store_target_cache(window_title: &str, target: &Target) {
+  TITLE_CACHE.with(|cell| {
+    *cell.borrow_mut() = Some(CachedTarget {
+      window_title: window_title.to_string(),
+      target: target.clone(),
+      cached_at: Instant::now(),
+    });
+  });
+}
+
+fn clear_target_cache() {
+  TITLE_CACHE.with(|cell| {
+    *cell.borrow_mut() = None;
+  });
 }
 
 /// Locate the foreground app's TextPattern. Shared by `run_probe` and
@@ -611,46 +833,24 @@ unsafe fn locate_target_for_hwnd(
 
   let mut pattern = text_pattern(&focused);
 
-  // Fallback strategy: search the foreground window subtree for the first
-  // element exposing TextPattern (e.g. the web-area document when focus is
-  // reported on a wrapper node).
-  if pattern.is_none() {
-    focus_info.via = "tree-search".into();
-    let flag = VARIANT::from(true);
-    let condition =
-      match automation.CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, &flag) {
-        Ok(c) => c,
-        Err(e) => {
-          return Err(fail_ctx(
-            result,
-            "ComError",
-            format!("CreatePropertyCondition failed: {e}"),
-          ))
-        }
-      };
-    let root: IUIAutomationElement = match automation.ElementFromHandle(hwnd) {
-      Ok(r) => r,
-      Err(e) => {
-        return Err(fail_ctx(
-          result,
-          "ElementNotFound",
-          format!("ElementFromHandle(foreground) failed: {e}"),
-        ))
-      }
-    };
-    match root.FindFirst(TreeScope_Descendants, &condition) {
-      Ok(el) => {
-        if el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) {
-          result.focused_element = Some(focus_info);
-          return Err(fail_ctx(
-            result,
-            "PasswordField",
-            "fallback element is a password field".into(),
-          ));
-        }
-        pattern = text_pattern(&el);
-      }
-      Err(_) => {
+  // A focused element can expose TextPattern without a selection (address
+  // bar), and iframe content lives in a separate Document lower in the UIA
+  // tree. Prefer the TextPattern that actually owns the live selection; fall
+  // back to the focused pattern, then to any TextPattern element.
+  let root: IUIAutomationElement = match automation.ElementFromHandle(hwnd) {
+    Ok(r) => r,
+    Err(e) => {
+      return Err(fail_ctx(
+        result,
+        "ElementNotFound",
+        format!("ElementFromHandle(foreground) failed: {e}"),
+      ))
+    }
+  };
+  let (found_pattern, found_element) =
+    match find_pattern_with_selection(&automation, &root, pattern.take()) {
+      Some(v) => v,
+      None => {
         result.focused_element = Some(focus_info);
         return Err(fail_ctx(
           result,
@@ -658,8 +858,22 @@ unsafe fn locate_target_for_hwnd(
           "no element exposing TextPattern found in foreground window (compatibility boundary, e.g. Chromium PDF viewer)".into(),
         ));
       }
+    };
+  if let Some(el) = found_element {
+    if el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) {
+      result.focused_element = Some(focus_info);
+      return Err(fail_ctx(
+        result,
+        "PasswordField",
+        "fallback element is a password field".into(),
+      ));
     }
+    focus_info.name = truncate(el_name(&el), 120);
+    focus_info.control_type = control_type_name(&el);
+    focus_info.process_id = el_pid(&el);
+    focus_info.via = "tree-search".into();
   }
+  pattern = Some(found_pattern);
   result.focused_element = Some(focus_info);
 
   let pattern: IUIAutomationTextPattern = match pattern {
@@ -682,12 +896,116 @@ unsafe fn locate_target_for_hwnd(
   })
 }
 
+/// True when the TextPattern currently exposes at least one non-empty
+/// selection range. A focused address bar also exposes TextPattern, so
+/// "pattern exists" is not enough — we need an actual selection.
+unsafe fn pattern_has_selection(pattern: &IUIAutomationTextPattern) -> bool {
+  let selection = match pattern.GetSelection() {
+    Ok(s) => s,
+    Err(_) => return false,
+  };
+  let count = selection.Length().unwrap_or(0);
+  if count <= 0 {
+    return false;
+  }
+  for i in 0..count {
+    if let Ok(range) = selection.GetElement(i) {
+      if let Ok(text) = range.GetText(-1) {
+        if !text.to_string().trim().is_empty() {
+          return true;
+        }
+      }
+    }
+  }
+  false
+}
+
+/// Find the TextPattern that owns the live selection under `root`.
+///
+/// Chromium exposes the page Document and an iframe's Document as separate
+/// elements. The first Document in tree order is often the parent page, whose
+/// `GetSelection` is empty when the user selected text inside the iframe.
+/// This helper checks the primary pattern first (fast path), then enumerates
+/// TextPattern-capable descendants for one that actually has a selection.
+/// If none has a selection, it falls back to the primary pattern, or the
+/// first TextPattern-capable element, so the caller still reports
+/// `EmptySelection` instead of `TextPatternNotSupported`.
+unsafe fn find_pattern_with_selection(
+  automation: &IUIAutomation,
+  root: &IUIAutomationElement,
+  primary: Option<IUIAutomationTextPattern>,
+) -> Option<(IUIAutomationTextPattern, Option<IUIAutomationElement>)> {
+  let mut primary = primary;
+  if let Some(p) = primary.as_ref() {
+    if pattern_has_selection(p) {
+      return Some((primary.take().unwrap(), None));
+    }
+  }
+
+  // Iframe content lives in a separate Document. There are usually only one
+  // or two Documents, while the full TextPattern set can be large — scan
+  // Documents first to keep the iframe path fast.
+  let mut first_doc: Option<(IUIAutomationTextPattern, IUIAutomationElement)> = None;
+  if let Ok(doc_cond) = automation.CreatePropertyCondition(
+    UIA_ControlTypePropertyId,
+    &VARIANT::from(UIA_DocumentControlTypeId.0),
+  ) {
+    if let Ok(docs) = root.FindAll(TreeScope_Descendants, &doc_cond) {
+      let len = docs.Length().unwrap_or(0).min(16);
+      for i in 0..len {
+        let el = match docs.GetElement(i) {
+          Ok(e) => e,
+          Err(_) => continue,
+        };
+        if let Some(p) = text_pattern(&el) {
+          if pattern_has_selection(&p) {
+            return Some((p, Some(el)));
+          }
+          if first_doc.is_none() {
+            first_doc = Some((p, el));
+          }
+        }
+      }
+    }
+  }
+
+  let mut first_any: Option<(IUIAutomationTextPattern, IUIAutomationElement)> = None;
+  let flag = VARIANT::from(true);
+  if let Ok(condition) =
+    automation.CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, &flag)
+  {
+    if let Ok(found) = root.FindAll(TreeScope_Descendants, &condition) {
+      let len = found.Length().unwrap_or(0).min(64);
+      for i in 0..len {
+        let el = match found.GetElement(i) {
+          Ok(e) => e,
+          Err(_) => continue,
+        };
+        if let Some(p) = text_pattern(&el) {
+          if pattern_has_selection(&p) {
+            return Some((p, Some(el)));
+          }
+          if first_any.is_none() {
+            first_any = Some((p, el));
+          }
+        }
+      }
+    }
+  }
+
+  if let Some(p) = primary {
+    return Some((p, None));
+  }
+  if let Some((p, el)) = first_doc {
+    return Some((p, Some(el)));
+  }
+  first_any.map(|(p, el)| (p, Some(el)))
+}
+
 struct WindowSearch {
   needle: String,
   found: Option<HWND>,
-}
-
-unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+}unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
   if !IsWindowVisible(hwnd).as_bool() {
     return BOOL(1);
   }
@@ -808,28 +1126,12 @@ unsafe fn locate_target_by_title(
     }
   }
 
-  // Fallback: any element exposing TextPattern.
-  if pattern.is_none() {
-    let flag = VARIANT::from(true);
-    let condition =
-      match automation.CreatePropertyCondition(UIA_IsTextPatternAvailablePropertyId, &flag) {
-        Ok(c) => c,
-        Err(e) => {
-          return Err(fail_ctx(
-            result,
-            "ComError",
-            format!("CreatePropertyCondition failed: {e}"),
-          ))
-        }
-      };
-    match root.FindFirst(TreeScope_Descendants, &condition) {
-      Ok(el) => {
-        focus_info.name = truncate(el_name(&el), 120);
-        focus_info.control_type = control_type_name(&el);
-        focus_info.process_id = el_pid(&el);
-        pattern = text_pattern(&el);
-      }
-      Err(_) => {
+  // The first Document may be the parent page. If the selection lives in an
+  // iframe, scan the tree for the Document that actually has a selection.
+  let (found_pattern, found_element) =
+    match find_pattern_with_selection(&automation, &root, pattern) {
+      Some(v) => v,
+      None => {
         result.focused_element = Some(focus_info);
         return Err(fail_ctx(
           result,
@@ -837,8 +1139,22 @@ unsafe fn locate_target_by_title(
           "no element exposing TextPattern found in the title-matched window".into(),
         ));
       }
+    };
+  if let Some(el) = found_element {
+    if el.CurrentIsPassword().map(|b| b.as_bool()).unwrap_or(false) {
+      result.focused_element = Some(focus_info);
+      return Err(fail_ctx(
+        result,
+        "PasswordField",
+        "fallback element is a password field".into(),
+      ));
     }
+    focus_info.name = truncate(el_name(&el), 120);
+    focus_info.control_type = control_type_name(&el);
+    focus_info.process_id = el_pid(&el);
+    focus_info.via = "tree-search".into();
   }
+  pattern = Some(found_pattern);
 
   result.focused_element = Some(focus_info);
   let pattern: IUIAutomationTextPattern = match pattern {
@@ -871,11 +1187,73 @@ unsafe fn run_probe_for_hwnd(hwnd: Option<HWND>) -> ProbeResult {
     Some(h) => locate_target_for_hwnd(h, start),
     None => locate_target(start),
   };
-  let target = match target {
-    Ok(t) => t,
-    Err(e) => return e,
+  match target {
+    Ok(t) => probe_target(t, start),
+    Err(e) => e,
+  }
+}
+
+/// Audit-only variant: locate the target by visible window title instead of
+/// `GetForegroundWindow()`. Used by automated D-1 runs.
+unsafe fn run_probe_for_title(window_title: &str) -> ProbeResult {
+  let start = Instant::now();
+  let cached = cached_target_for_title(window_title);
+  let used_cache = cached.is_some();
+
+  let target = match cached {
+    Some(t) => Ok(t),
+    None => {
+      let locate_start = Instant::now();
+      let located = locate_target_by_title(window_title, start);
+      let locate_ms = locate_start.elapsed().as_secs_f64() * 1000.0;
+      if let Ok(ref t) = located {
+        store_target_cache(window_title, t);
+      }
+      if std::env::var_os("UIA_PROFILE").is_some() {
+        eprintln!(
+          "[uia-profile] title={window_title:?} locate={locate_ms:.1}ms cache=miss"
+        );
+      }
+      located
+    }
   };
 
+  let mut result = match target {
+    Ok(t) => probe_target(t, start),
+    Err(e) => e,
+  };
+
+  // A cached pattern can become stale after navigation. Retry once with a
+  // fresh locate before reporting a failure.
+  if used_cache
+    && matches!(
+      result.error_code.as_deref(),
+      Some("EmptySelection") | Some("ElementNotFound") | Some("ComError")
+    )
+  {
+    clear_target_cache();
+    let retry_start = Instant::now();
+    let located = locate_target_by_title(window_title, retry_start);
+    if let Ok(ref t) = located {
+      store_target_cache(window_title, t);
+    }
+    result = match located {
+      Ok(t) => probe_target(t, retry_start),
+      Err(e) => e,
+    };
+  }
+
+  if std::env::var_os("UIA_PROFILE").is_some() {
+    eprintln!(
+      "[uia-profile] title={window_title:?} cache={} total={:.1}ms",
+      if used_cache { "hit" } else { "miss" },
+      result.native_elapsed_ms
+    );
+  }
+  result
+}
+
+unsafe fn probe_target(target: Target, start: Instant) -> ProbeResult {
   let mut result = ProbeResult {
     success: false,
     process_name: target.process_name,
@@ -967,6 +1345,127 @@ unsafe fn run_probe_for_hwnd(hwnd: Option<HWND>) -> ProbeResult {
   result.text = Some(text);
   result.rect_count = rects.len() as u32;
   result.rects = rects;
+  result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+  result
+}
+
+// ---------------------------------------------------------------------------
+// RangeFromPoint probe (Q-6 audit-only)
+// ---------------------------------------------------------------------------
+
+/// Resolve the word under an absolute screen point via
+/// `IUIAutomationTextPattern::RangeFromPoint` + `ExpandToEnclosingUnit(Word)`.
+/// This is the fallback path for "translate the word under the cursor" when
+/// the app cannot return a live selection.
+unsafe fn run_range_probe(x: f64, y: f64, window_title: Option<String>) -> RangeProbeResult {
+  let start = Instant::now();
+  let target = match window_title {
+    Some(title) => locate_target_by_title(&title, start),
+    None => locate_target(start),
+  };
+  let target = match target {
+    Ok(t) => t,
+    Err(e) => return RangeProbeResult::from_probe_error(e, start),
+  };
+
+  let mut result = RangeProbeResult {
+    success: false,
+    process_name: target.process_name,
+    process_id: target.process_id,
+    window_title: target.window_title,
+    element_name: String::new(),
+    element_control_type: String::new(),
+    via: String::new(),
+    text: String::new(),
+    word: String::new(),
+    native_elapsed_ms: 0.0,
+    error_code: None,
+    error_message: None,
+    warnings: Vec::new(),
+  };
+
+  let fail_ctx = |mut result: RangeProbeResult, code: &str, msg: String| -> RangeProbeResult {
+    result.success = false;
+    result.error_code = Some(code.to_string());
+    result.error_message = Some(msg);
+    result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    result
+  };
+
+  let point = POINT {
+    x: x.round() as i32,
+    y: y.round() as i32,
+  };
+
+  let automation: IUIAutomation =
+    match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+      Ok(a) => a,
+      Err(e) => {
+        return fail_ctx(
+          result,
+          "ComError",
+          format!("CoCreateInstance(CLSID_CUIAutomation) failed: {e}"),
+        )
+      }
+    };
+
+  // Prefer the element under the point (the path a product fallback would
+  // use). Fall back to the target window's TextPattern if the element does
+  // not expose TextPattern.
+  let mut pattern = target.pattern;
+  let mut via = "target-pattern".to_string();
+  match automation.ElementFromPoint(point) {
+    Ok(el) => {
+      result.element_name = truncate(el_name(&el), 120);
+      result.element_control_type = control_type_name(&el);
+      if let Some(p) = text_pattern(&el) {
+        pattern = p;
+        via = "element-from-point".into();
+      }
+    }
+    Err(e) => result
+      .warnings
+      .push(format!("ElementFromPoint({x:.0},{y:.0}) failed: {e}")),
+  }
+  result.via = via;
+
+  let range = match pattern.RangeFromPoint(point) {
+    Ok(r) => r,
+    Err(e) => {
+      return fail_ctx(
+        result,
+        "RangeFromPointFailed",
+        format!("TextPattern.RangeFromPoint failed: {e}"),
+      )
+    }
+  };
+
+  match range.GetText(-1) {
+    Ok(t) => result.text = t.to_string(),
+    Err(e) => result.warnings.push(format!("point range GetText failed: {e}")),
+  }
+
+  if let Err(e) = range.ExpandToEnclosingUnit(TextUnit_Word) {
+    return fail_ctx(
+      result,
+      "ExpandWordFailed",
+      format!("ExpandToEnclosingUnit(Word) failed: {e}"),
+    );
+  }
+  match range.GetText(-1) {
+    Ok(t) => result.word = t.to_string(),
+    Err(e) => result.warnings.push(format!("word range GetText failed: {e}")),
+  }
+
+  if result.word.trim().is_empty() && result.text.trim().is_empty() {
+    return fail_ctx(
+      result,
+      "EmptyPoint",
+      "RangeFromPoint returned no text at the given point".into(),
+    );
+  }
+
+  result.success = true;
   result.native_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
   result
 }
@@ -1379,6 +1878,7 @@ impl Task for ProbeTask {
 
 pub struct ProbeTaskDetailed {
   pub timeout_ms: u32,
+  pub window_title: Option<String>,
 }
 
 impl Task for ProbeTaskDetailed {
@@ -1386,7 +1886,13 @@ impl Task for ProbeTaskDetailed {
   type JsValue = ProbeResult;
 
   fn compute(&mut self) -> Result<Self::Output> {
-    Ok(probe_with_timeout(Duration::from_millis(self.timeout_ms as u64)))
+    Ok(match &self.window_title {
+      Some(title) => probe_with_timeout_title(
+        Duration::from_millis(self.timeout_ms as u64),
+        title.clone(),
+      ),
+      None => probe_with_timeout(Duration::from_millis(self.timeout_ms as u64)),
+    })
   }
 
   fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -1407,9 +1913,19 @@ pub fn probe_selection(timeout_ms: Option<u32>) -> AsyncTask<ProbeTask> {
 /// Full audit variant of `probeSelection` — every diagnostic field (focused
 /// element, timing breakdown, warnings). Used by the PoC log
 /// path; product code should prefer `probeSelection`.
+///
+/// `windowTitle` is automation-only: when present, locate a visible top-level
+/// window by title substring instead of using `GetForegroundWindow()`. This
+/// is needed by the D-1 runner, which may not own the foreground window.
 #[napi(ts_return_type = "Promise<ProbeResult>")]
-pub fn probe_selection_detailed(timeout_ms: Option<u32>) -> AsyncTask<ProbeTaskDetailed> {
-  AsyncTask::new(ProbeTaskDetailed { timeout_ms: timeout_ms.unwrap_or(500) })
+pub fn probe_selection_detailed(
+  timeout_ms: Option<u32>,
+  window_title: Option<String>,
+) -> AsyncTask<ProbeTaskDetailed> {
+  AsyncTask::new(ProbeTaskDetailed {
+    timeout_ms: timeout_ms.unwrap_or(500),
+    window_title,
+  })
 }
 
 pub struct ExpandTask {
@@ -1451,6 +1967,52 @@ pub fn probe_expand_units(
 ) -> AsyncTask<ExpandTask> {
   AsyncTask::new(ExpandTask {
     timeout_ms: timeout_ms.unwrap_or(500),
+    window_title,
+  })
+}
+
+pub struct RangeTask {
+  pub timeout_ms: u32,
+  pub x: f64,
+  pub y: f64,
+  pub window_title: Option<String>,
+}
+
+impl Task for RangeTask {
+  type Output = RangeProbeResult;
+  type JsValue = RangeProbeResult;
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    Ok(range_with_timeout(
+      Duration::from_millis(self.timeout_ms as u64),
+      self.x,
+      self.y,
+      self.window_title.clone(),
+    ))
+  }
+
+  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+    Ok(output)
+  }
+}
+
+/// Q-6 audit probe: resolve the word at an absolute screen point via
+/// `RangeFromPoint` + `ExpandToEnclosingUnit(Word)`.
+///
+/// Coordinates are physical screen pixels (the same space as `SelectionRect`).
+/// `windowTitle` is optional and automation-only, matching
+/// `probeSelectionDetailed`.
+#[napi(ts_return_type = "Promise<RangeProbeResult>")]
+pub fn probe_range_from_point(
+  x: f64,
+  y: f64,
+  timeout_ms: Option<u32>,
+  window_title: Option<String>,
+) -> AsyncTask<RangeTask> {
+  AsyncTask::new(RangeTask {
+    timeout_ms: timeout_ms.unwrap_or(500),
+    x,
+    y,
     window_title,
   })
 }

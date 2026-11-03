@@ -56,11 +56,14 @@ H:\UIA-demo\
 │       └── uia-probe.d.ts   # 原生 napi 模块的 TypeScript 类型定义
 ├── testpage/                # 本地测试页面
 │   ├── index.html           # 包含丰富 HTML 段落、中英混排、输入框的测试页
+│   ├── iframe.html          # iframe 父页面（D-1 第 3 类页面）
+│   ├── iframe-child.html    # iframe 子文档（英文段落，供选区探针使用）
 │   └── sample.pdf           # 用于测试 Edge/Chrome 内置 PDF 插件取词边界的样本文件
 ├── scripts/                 # 构建与辅助脚本
 │   ├── build-native.mjs     # 编译 Rust 原生模块并移动 .node 文件
 │   ├── gen-pdf.mjs          # 生成测试用 PDF 文件
-│   └── expand-probe-e2e.mjs # ExpandToEnclosingUnit 自动化验证（CDP 选区 + 原生探针）
+│   ├── expand-probe-e2e.mjs # ExpandToEnclosingUnit 自动化验证（CDP 选区 + 原生探针）
+│   └── d1-feasibility.mjs   # D-1 30 次统计 + Q-6 RangeFromPoint + iframe 验证
 ├── uia-config.json          # 本地持久化配置（热键、超时时间等，存在默认降级）
 ├── uia-probe.log            # 运行日志（每次探测的耗时与结果 JSON）
 └── README.md                # 完整的技术调研报告、场景兼容矩阵与实测耗时数据
@@ -94,6 +97,11 @@ H:\UIA-demo\
   pnpm test:expand
   # 等价于 node scripts/expand-probe-e2e.mjs
   ```
+- **D-1 自动化统计**（3 类页面 × 5 单词 + 5 句子 + Q-6；支持 `--browser chrome|edge`）：
+  ```bash
+  pnpm test:d1
+  pnpm test:d1 --browser edge
+  ```
 - **原生圆点原型**：
   ```bash
   pnpm start
@@ -116,8 +124,8 @@ H:\UIA-demo\
    - Windows UIA COM 是同步阻塞调用。绝不能在 Electron 主线程/UI 线程直接调用未做超时的 COM 接口。Native 模块必须维持 MTA 独立工作线程机制。
 3. **Chromium 无障碍树激活边界 (A11y Tree Activation)**：
    - Chromium 默认处于惰性/精简无障碍模式。首次可能出现文本能够通过 TextPattern 读取但物理矩形数组为空（`rectCount: 0`）的情况；一旦 Chromium 触发无障碍树完全激活（或开启屏幕阅读器支持），逐行物理坐标即可稳定提取。
-4. **物理像素与 DPI 缩放**：
-   - UIA 返回的 `BoundingRectangles` 为系统**物理像素**（Physical Pixels）。前端若要在 CSS 逻辑像素下精确定位浮窗，需考虑屏幕的 `devicePixelRatio` 缩放换算。
+4. **坐标空间与 DPI 缩放**：
+   - UIA `BoundingRectangles` **不保证物理像素**。Chrome/Edge 156 在 175% DPI 下，D-1 的 30 个样本中多数与 screen CSS 像素吻合（Chrome 26/30、Edge 28/30），少数与物理像素吻合。定位圆点/卡片前必须做坐标空间检测或归一化；不要直接当物理像素用。
 5. **PDF 阅读器支持限制**：
    - Chrome / Edge 内置的 PDF Viewer 使用了独立的虚拟渲染管线，通常不暴露标准的 TextPattern 选区，属于已知的兼容边界。
 6. **Chromium 无障碍树激活（自动化前提）**：
@@ -133,6 +141,11 @@ H:\UIA-demo\
    - mouse-up 全局钩子里同步 probe（150ms 超时）是原型简化；产品应把 probe 移到异步事件源，避免慢应用拖慢鼠标输入。
    - 选区清除检测在原型里用 600ms 低频复查兜底（鼠标路径立即隐藏）；产品应改用 `UIA_Text_TextSelectionChangedEventId`。
    - 圆点不可拖拽；只有 8px 视觉 + 24px 热区；hover 手型光标；无 tooltip、无放大。
+9. **D-1 已通过（2026-11-03，Chrome/Edge 156）**：
+   - 30/30 取词成功；P95 16.2ms（Chrome）/ 24.2ms（Edge），max 30.1/26.3ms；零剪贴板写入。
+   - Q-6 `RangeFromPoint` 28/30（93.3%；重复运行 28–29/30）；iframe 内选区 10/10。
+   - Q-6 失败点集中在文章页 / GitHub README 的单词边界（每次运行 1–2 次），属于选区起点/单词边界的点位问题，不是整体不可用。
+   - 未覆盖：Q-7 Chrome <138/企业策略、Q-2 全屏置顶、跨域 iframe。
 
 ---
 
@@ -162,6 +175,7 @@ H:\UIA-demo\
 | `native/package.json` | napi-rs 包配置（`main`/`types` 指向） | 直接复制，改名 package name |
 | `scripts/build-native.mjs` | 绕开 `@napi-rs/cli` 的构建脚本：`cargo build --release` 后把 `uia_probe.dll` 复制为 `uia_probe.win32-x64-msvc.node` | 直接复制。注意末尾产物文件名 = `{crate名下划线化}.{平台三元组}.node`，改名时两处必须同步 |
 | `examples/rect_probe.rs`（可选） | 免 GUI 的命令行诊断工具 | 强烈建议带走，新环境首次联调时用于快速隔离 UIA 问题 |
+| `scripts/d1-feasibility.mjs`（可选） | D-1 30 次统计 + Q-6 + iframe 的自动化验收脚本 | 建议带走；需同步 `testpage/iframe*.html` |
 | `src/types/uia-probe.d.ts` | napi 模块的 TS 类型契约 | 复制到新项目对应位置；`declare module 'uia-probe'` 的模块名需与新包名一致 |
 
 ### 7.2 迁移时的关键设计红线（验证过的行为，勿改动）
@@ -169,9 +183,10 @@ H:\UIA-demo\
 1. **MTA 工作线程 + 硬超时结构**：`lib.rs` 的架构是「JS 侧 `napi::Task`（libuv 线程池）→ mpsc channel → 专用 COM MTA 线程执行同步 UIA 调用」。超时后**放弃孤儿线程、下次调用换新线程**。新项目若改成直接在 Task 里做 COM 调用（不经过 MTA worker channel），目标应用卡死时会拖死宿主进程——这是本方案的核心卖点，不可简化。
 2. **COM 初始化单元**：工作线程内必须是 `CoInitializeEx(COINIT_MULTITHREADED)`（MTA），而非 STA。
 3. **零剪贴板原则**：`lib.rs` 全文无任何剪贴板 API，迁移时同样禁止引入 `SendInput`/`keybd_event` 模拟 `Ctrl+C` 的降级路径。
-4. **双重定位策略**：先 `GetFocusedElement` 直取 TextPattern（最快路径），失败则回退到前台窗口子树检索（`tree-search`，过滤 Document/Edit 控件类型）。`FocusInfo.via` 字段记录命中策略。
+4. **双重定位策略**：先 `GetFocusedElement` 直取 TextPattern（最快路径），失败则回退到前台窗口子树检索（`tree-search`）。标题/自动化路径会先找 Document，再扫描全部 TextPattern，优先选择**当前有非空 selection** 的那个（iframe 的 Document 不是树序第一个）。`FocusInfo.via` 字段记录命中策略。
 5. **防御性上限**：`MAX_TEXT_CHARS = 10_000`、`MAX_RECTS = 4_096`，防止异常目标返回超大 SAFEARRAY 拖垮内存。
 6. **`default-features = false`**：`napi` crate 必须关闭默认 features 只留 `napi8`，避免引入不必要的 tokio/异步运行时。
+7. **标题路径短缓存**：`run_probe_for_title` 对 `(window_title, TextPattern)` 做 5s 线程内缓存；命中时探测 0.5–4ms，未命中 15–60ms。缓存失效（`EmptySelection`/`ElementNotFound`/`ComError`）时清缓存并重定位一次。产品前台路径不走这个缓存。
 
 ### 7.3 接入新宿主项目的步骤
 
@@ -179,9 +194,9 @@ H:\UIA-demo\
 2. **构建接线**：把 `scripts/build-native.mjs` 挂到新项目 `package.json` 的 `build:native` script，并在 `build`/`dev` 前置执行（或用 `prebuild` 钩子）。
 3. **进程接线**（以 Electron 为例，其他框架同构）：
    - 只在**主进程** `require('uia-probe')`——native 模块不能进 renderer；
-   - 参照本项目 `src/main/index.ts`：注册全局热键/触发器 → 调 `probeSelectionDetailed(timeoutMs)` → 结果经 IPC 推给 UI；
+   - 参照本项目 `src/main/index.ts`：注册全局热键/触发器 → 调 `probeSelectionDetailed(timeoutMs, windowTitle?)` → 结果经 IPC 推给 UI；
    - renderer 一律通过 `contextBridge`（preload）访问，参照 `src/preload/index.ts`。
-4. **消费哪个接口**：产品代码只消费 `probeSelection()`（4 字段）；`probeSelectionDetailed()` 仅用于日志/审计。不要把 `ProbeResult` 的 12 个字段直接透传进产品 UI。
+4. **消费哪个接口**：产品代码只消费 `probeSelection()`（4 字段）；`probeSelectionDetailed()` / `probeExpandUnits()` / `probeRangeFromPoint()` 仅用于日志/审计。不要把 `ProbeResult` 的 12 个字段直接透传进产品 UI。
 5. **重命名检查表**：若 crate 从 `uia-probe` 改名，需同步 4 处——`Cargo.toml [package] name`、`scripts/build-native.mjs` 的 dll→node 复制文件名、`native/index.js` 的 require 路径、TS 声明文件 `declare module '<新包名>'`。
 
 ### 7.4 环境与平台约束
@@ -189,5 +204,5 @@ H:\UIA-demo\
 - **仅限 Windows**：依赖 `Win32_UI_Accessibility`，无法跨平台编译；CI/打包必须用 `windows-latest`（VS Build Tools + Windows SDK + Rust MSVC 工具链均预装）。
 - **仅支持 x64 MSVC**：产物名固定为 `win32-x64-msvc`。ARM64 需加 target `aarch64-pc-windows-msvc` 并产出 `uia_probe.win32-arm64-msvc.node`。
 - **N-API ABI 稳定**：使用 napi（而非 neon），编译一次即可跨 Node/Electron 版本复用，**无需针对 Electron 重编译**。
-- **DPI 语义**：返回坐标一律为物理像素；新宿主若运行在 CSS 逻辑像素体系（如 Electron renderer），需自行除以 `devicePixelRatio`。
+- **DPI / 坐标语义**：UIA 返回的 rect **不保证物理像素**。Chrome/Edge 156 在 175% DPI 下实测多数为 screen CSS 像素；新宿主若用物理像素做窗口定位，必须先做坐标空间检测或按 `devicePixelRatio` 归一化。`RangeFromPoint` 的入参也需要同时尝试两种空间。
 - **目标端前提**：被探测的 Chromium 应用需激活无障碍树（首次探测出现 `text` 有值但 `rectCount: 0` 即此边界）；内置 PDF Viewer 不支持。

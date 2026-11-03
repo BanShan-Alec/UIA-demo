@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>UIA iframe child</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; font-size: 17px; margin: 20px; }
+    p { line-height: 1.7; }
+  </style>
+</head>
+<body>
+  <h2>Iframe child content</h2>
+
+  <p id="f1">IFRAME-1 The accessibility tree exposes an iframe as its own Document. A selection inside the child should be readable without touching the parent document.</p>
+
+  <p id="f2">IFRAME-2 Chromium keeps a separate text pattern for each frame. The probe must pick the pattern that currently owns the highlighted range.</p>
+
+  <p id="f3">IFRAME-3 Reading a word from a nested document is the same UIA call as reading it from the top-level page. The only difference is which element is selected as the target.</p>
+
+  <p id="f4">IFRAME-4 If the probe stops at the first Document in tree order, it will read the parent page and miss the iframe selection entirely.</p>
+
+  <p id="f5">IFRAME-5 A robust fallback scans the TextPattern-capable descendants and prefers the one with a non-empty selection.</p>
+
+  <p id="f6">IFRAME-6 This paragraph is extra material so the test always has at least five eligible blocks even if one paragraph is filtered out.</p>
+</body>
+</html>

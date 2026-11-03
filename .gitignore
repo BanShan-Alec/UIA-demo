@@ -11,6 +11,9 @@ native/uia_probe.d.ts
 /expand-probe-report.json
 /expand-report-*.json
 
+# D-1 feasibility reports
+/d1-*.json
+
 # Temporary browser profiles from manual probes
 /.chrome-test*/
 /.edge-test*/

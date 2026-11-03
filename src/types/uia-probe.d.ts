@@ -1,5 +1,7 @@
 declare module 'uia-probe' {
-  /** Per-line selection bounding box, absolute physical pixels. */
+  /** Per-line screen bounding box. Not guaranteed to be physical pixels:
+   *  Chrome/Edge 156 at 175% DPI returned screen CSS pixels in most D-1
+   *  samples; normalize against devicePixelRatio before positioning. */
   export interface SelectionRect {
     x: number
     y: number
@@ -82,6 +84,27 @@ declare module 'uia-probe' {
     warnings: string[]
   }
 
+  /** Audit-only result of probeRangeFromPoint (Q-6). */
+  export interface RangeProbeResult {
+    success: boolean
+    processName: string
+    processId: number
+    windowTitle: string
+    /** Element returned by ElementFromPoint, if available. */
+    elementName: string
+    elementControlType: string
+    /** "element-from-point" or "target-pattern". */
+    via: string
+    /** Text of the degenerate range at the point. */
+    text: string
+    /** Word enclosing the point after ExpandToEnclosingUnit(Word). */
+    word: string
+    nativeElapsedMs: number
+    errorCode: string | null
+    errorMessage: string | null
+    warnings: string[]
+  }
+
   /** Event emitted when the native dot is clicked. */
   export interface DotSelectionEvent {
     text: string
@@ -95,8 +118,13 @@ declare module 'uia-probe' {
 
   /** Product call. errorCode null = success. */
   export function probeSelection(timeoutMs?: number): Promise<SelectionResult>
-  /** Audit call (full fields) — used by the PoC log path. */
-  export function probeSelectionDetailed(timeoutMs?: number): Promise<ProbeResult>
+  /** Audit call (full fields) — used by the PoC log path.
+   *  `windowTitle` is automation-only: find a visible window by title substring
+   *  instead of using GetForegroundWindow. */
+  export function probeSelectionDetailed(
+    timeoutMs?: number,
+    windowTitle?: string
+  ): Promise<ProbeResult>
   /** Audit call: ExpandToEnclosingUnit measurements for the live selection.
    *  `windowTitle` is automation-only: find a visible window by title substring
    *  instead of using GetForegroundWindow. */
@@ -104,6 +132,15 @@ declare module 'uia-probe' {
     timeoutMs?: number,
     windowTitle?: string
   ): Promise<ExpandProbeResult>
+  /** Audit call (Q-6): word at an absolute physical screen point via
+   *  RangeFromPoint + ExpandToEnclosingUnit(Word). `windowTitle` is
+   *  automation-only, matching probeSelectionDetailed. */
+  export function probeRangeFromPoint(
+    x: number,
+    y: number,
+    timeoutMs?: number,
+    windowTitle?: string
+  ): Promise<RangeProbeResult>
   /** Start the native Win32 dot thread. The callback runs once per dot click. */
   export function startDot(callback: (event: DotSelectionEvent) => void): void
   /** Stop the native dot thread (call on app quit). */

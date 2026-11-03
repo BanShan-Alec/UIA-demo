@@ -14,6 +14,7 @@
 │   ├── src/lib.rs           # UIA COM 探测核心（专用 COM MTA 工作线程 + 500ms 超时）
 │   │                        #   导出 probeSelection（产品 4 字段）/ probeSelectionDetailed（审计）
 │   │                        #   / probeExpandUnits（ExpandToEnclosingUnit 审计）
+│   │                        #   / probeRangeFromPoint（Q-6 单词兜底审计）
 │   ├── src/dot.rs           # 原生 Win32 圆点窗口线程 + 全局鼠标钩子 + TSFN 回调
 │   └── examples/rect_probe.rs  # 无 GUI 诊断工具：枚举窗口内 TextPattern 元素，
 │                               # 编程式 Select 后dump文本/坐标（用于排查精简模式）
@@ -101,20 +102,22 @@ $env:UIA_DOT_SELFTEST='1'; pnpm start
 
 ## 产品接口 vs 审计接口
 
-原生模块导出三个 probe 函数，共用同一个 UIA worker / 500ms 超时机制；另外导出 `startDot` / `stopDot` 管理原生圆点线程。
+原生模块导出四个 probe 函数，共用同一个 UIA worker / 500ms 超时机制；另外导出 `startDot` / `stopDot` 管理原生圆点线程。
 
 **`probeSelection(timeoutMs?) → SelectionResult`** — 产品接口，划词翻译只需要这 4 个字段：
 
 | 字段 | 说明 |
 | --- | --- |
 | `text` | 选中文本（空串 = 无有效选区） |
-| `rects` | 逐行物理像素包围盒；`rects[0]` 即气泡锚点 |
+| `rects` | 逐行屏幕包围盒；`rects[0]` 即气泡锚点。**不保证物理像素**：Chrome/Edge 156 在 175% DPI 下多数返回 screen CSS 像素，定位前需按 `devicePixelRatio` 归一化或检测 |
 | `errorCode` | `null` = 成功；否则 `EmptySelection` / `TextPatternNotSupported` / `Timeout` / … |
 | `processName` | 前台应用进程名，用于按应用启停划词的规则过滤 |
 
-**`probeSelectionDetailed(timeoutMs?) → ProbeResult`** — 审计接口（12 字段），仅供 PoC 验收日志使用：增加 `success`、`windowTitle`、`processId`、`focusedElement`（焦点元素类型与定位策略）、`nativeElapsedMs`（原生耗时分解）、`warnings`。字段含义见 `src/types/uia-probe.d.ts`。
+**`probeSelectionDetailed(timeoutMs?, windowTitle?) → ProbeResult`** — 审计接口（12 字段），仅供 PoC 验收日志使用：增加 `success`、`windowTitle`、`processId`、`focusedElement`（焦点元素类型与定位策略）、`nativeElapsedMs`（原生耗时分解）、`warnings`。`windowTitle` 仅用于自动化：按可见窗口标题子串定位，而不是读 `GetForegroundWindow()`。字段含义见 `src/types/uia-probe.d.ts`。
 
 **`probeExpandUnits(timeoutMs?, windowTitle?) → ExpandProbeResult`** — 审计接口，仅用于 `ExpandToEnclosingUnit` 验证。它读取当前选区，分别以「选区原样」和「折叠到选区起点」两种模式，对 7 种 `TextUnit` 调用 `ExpandToEnclosingUnit`，返回每种单位的字符数、文本预览、矩形数量和 `equalsDocument`。`windowTitle` 仅用于自动化：按可见窗口标题子串定位，而不是读 `GetForegroundWindow()`（CI / 锁屏桌面没有前台窗口时必需）。
+
+**`probeRangeFromPoint(x, y, timeoutMs?, windowTitle?) → RangeProbeResult`** — Q-6 审计接口：对绝对屏幕点调用 `TextPattern.RangeFromPoint`，再 `ExpandToEnclosingUnit(Word)`，返回 `word`、`text`、命中元素类型与 `via`（`element-from-point` / `target-pattern`）。`x/y` 的坐标空间与 UIA rect 相同（当前实测多为 screen CSS 像素），脚本会同时尝试原始值与 `× devicePixelRatio` 的物理值。
 
 **`startDot(callback) / stopDot()`** — 原生圆点线程。`callback` 在每次点击圆点时收到 `DotSelectionEvent`：`text`、`rects`、`processName`、`paragraph`、`paragraphError`、`dotRect`（物理像素）。仅在 Electron 主进程调用。
 
@@ -170,8 +173,61 @@ pnpm test:expand --url "https://martinfowler.com/articles/microservices.html" --
 
 ### 覆盖范围与未测项
 
-- 已测：Chrome 156 / Edge 156；testpage（英文段落、CJK、嵌套 inline、跨段选区）、Wikipedia 首段、GitHub README 首段、Martin Fowler《Microservices》首段。
-- 未测：iframe 内选区、canvas/PDF、管理员权限窗口、多显示器第二屏、Chrome <138、企业 `UiAutomationProviderEnabled` 策略回退。iframe 是 D-1 的独立项，需在 iframe 内取到 Document 后重复本探针。
+- 已测：Chrome 156 / Edge 156；testpage（英文段落、CJK、嵌套 inline、跨段选区）、Wikipedia 首段、GitHub README 首段、Martin Fowler《Microservices》首段；同源 iframe（D-1）。
+- 未测：跨域 iframe、canvas/PDF、管理员权限窗口、多显示器第二屏、Chrome <138、企业 `UiAutomationProviderEnabled` 策略回退。
+
+## D-1 验收结果（2026-11-03，Chrome/Edge 156）
+
+D-1 的验收标准（来自 Snapword PRD）：
+
+- 3 类页面各选 10 次（单词 5 次、句子 5 次），共 30 次
+- 取词成功率 ≥ 90%
+- 单次取词耗时 ≤ 50ms
+- 不产生任何剪贴板写入
+- 附带验证 `RangeFromPoint`（Q-6）与 iframe 场景
+
+3 类页面：**普通文章页（英文维基）**、**GitHub README（microsoft/vscode）**、**含 iframe 的本地页面**。
+
+### 结果
+
+| 浏览器 | 成功 | P50 | P95 | Max | Q-6 | 剪贴板写入 |
+|---|---:|---:|---:|---:|---:|---:|
+| Chrome 156.0.8078.49 | **30/30 (100%)** | 1.7ms | 16.2ms | 30.1ms | 28/30 (93.3%) | 0 |
+| Edge 156.0.4314.50 | **30/30 (100%)** | 1.0ms | 24.2ms | 26.3ms | 28/30 (93.3%) | 0 |
+
+分页面（Chrome / Edge）：
+
+| 页面 | 成功 | P95（Chrome / Edge） | Q-6（Chrome / Edge） |
+|---|---:|---:|---:|
+| 普通文章页 | 10/10 / 10/10 | 30.1ms / 10.0ms | 9/10 / 8/10 |
+| GitHub README | 10/10 / 10/10 | 10.4ms / 26.3ms | 9/10 / 10/10 |
+| 含 iframe 页面 | 10/10 / 10/10 | 16.2ms / 24.2ms | 10/10 / 10/10 |
+
+**结论：D-1 在 Chrome/Edge 156 上通过。** 30 次取词全部命中，P95 低于 50ms，未观察到剪贴板写入；iframe 内选区可以读取，`RangeFromPoint` 可用率 93.3%（重复运行 28–29/30）。
+
+### 复现
+
+```powershell
+pnpm build:native
+pnpm test:d1 --browser chrome
+pnpm test:d1 --browser edge
+```
+
+结果写入 `d1-probe-report-*.json`（已忽略），包含每次选区的文本、rect、耗时、`rectSpace`、Q-6 尝试与错误码。
+
+### 两个重要发现
+
+1. **iframe 需要按 Document 找 TextPattern，而不是取第一个 Document。** 父页面的 Document 在树序中先出现，`GetSelection` 为空；探针现在先扫 Document，再扫全部 TextPattern，优先选择有非空 selection 的那个。
+2. **不要假定 UIA rect 一定是物理像素。** 在 175% DPI 下，Chrome/Edge 156 返回的 rect 多数与 screen CSS 像素吻合（Chrome 26/30、Edge 28/30），少数样本与物理像素吻合。Q-6 脚本同时尝试 `rect * devicePixelRatio` 与原始 rect，才达到 93.3%–96.7%。产品做圆点/卡片定位时必须做坐标空间归一化或检测，不能直接当物理像素用。
+3. **Q-6 失败点集中在文章页 / GitHub README 的单词边界（每次运行 1–2 次）。** 属于选区起点/单词边界的点位问题，不是 `RangeFromPoint` 整体不可用；当前结果支持把它作为兜底能力，但需要失败重试/二次取点。
+
+### 未覆盖
+
+- Q-7：Chrome <138、企业 `UiAutomationProviderEnabled` 策略回退未测。
+- Q-2：全屏应用下卡片置顶未测。
+- 跨域 iframe、canvas/PDF、管理员权限窗口、多显示器第二屏未测。
+
+
 
 ## 原有划词实测数据（Windows 11 26100，Edge 137，200% DPI）
 

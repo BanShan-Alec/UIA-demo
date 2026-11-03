@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>UIA-IFRAME-TEST</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; font-size: 18px; margin: 32px; max-width: 900px; }
+    iframe { display: block; width: 760px; height: 620px; margin-top: 16px; border: 1px solid #bbb; }
+    .hint { color: #777; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>UIA iframe selection test</h1>
+  <p id="parent-p">This parent page exists so the probe has to choose between two Documents: the outer page and the iframe child. A selection made inside the iframe must be read from the iframe's own TextPattern, not from the parent page.</p>
+  <p class="hint">The selectable paragraphs are inside the iframe below.</p>
+  <iframe id="content-frame" src="iframe-child.html" title="UIA iframe child"></iframe>
+</body>
+</html>
